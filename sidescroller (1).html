@@ -1,0 +1,1025 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>횡스크롤 게임 - 모스크바 1998</title>
+<style>
+  :root { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #25282b; overflow: hidden; touch-action: none; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; }
+  #dev-tools { position: absolute; top: 10px; right: 10px; z-index: 100; font-family: sans-serif; }
+  #dev-btn { padding: 6px 12px; background: #333; color: #fff; border: 1px solid #555; border-radius: 4px; cursor: pointer; font-size: 13px; }
+  #dev-panel { display: none; margin-top: 4px; background: rgba(20,22,26,.85); padding: 6px; border-radius: 4px; }
+  #dev-panel button { display: block; width: 100%; margin: 3px 0; padding: 4px 8px; font-size: 12px; background: #444; color: #fff; border: 1px solid #666; border-radius: 3px; cursor: pointer; text-align: left; }
+  #dev-panel button:hover { background: #555; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="dev-tools">
+  <button id="dev-btn">DEV</button>
+  <div id="dev-panel">
+    <button id="btn-revive">부활</button>
+    <button id="btn-skip-round">라운드 스킵</button>
+    <button id="btn-skip-wait">대기 스킵</button>
+    <button id="btn-confirm-vote">투표 확정</button>
+  </div>
+</div>
+<script>
+(() => {
+  const cv = document.getElementById('c');
+  const mainCtx = cv.getContext('2d');
+  let ctx = mainCtx; // 가구 윤곽 측정 때 잠시 다른 캔버스로 바뀜
+  const W = 800, H = 450, GROUND_H = 80, GROUND_Y = H - GROUND_H, G = GROUND_Y;
+
+  function resize() {
+    const dpr = window.devicePixelRatio || 1;
+    const s = Math.min(innerWidth / W, innerHeight / H);
+    cv.style.width = W * s + 'px'; cv.style.height = H * s + 'px';
+    cv.width = W * s * dpr; cv.height = H * s * dpr;
+    mainCtx.setTransform(s * dpr, 0, 0, s * dpr, 0, 0);
+  }
+  addEventListener('resize', resize);
+  resize();
+
+  // ---------- 축척: 플레이어 키 48px = 180cm ----------
+  const PPM = 48 / 1.8;
+  const m = v => Math.round(v * PPM);
+
+  let camX = 0;
+  const GRAVITY = 1400, JUMP_V = 300, SPEED = 170;
+  const ZOOM = 1.6, CAM_TOP = GROUND_Y - 355 / ZOOM, CAM_LEAD = 175;
+  const player = { wx: 120, y: GROUND_Y - 48, w: 18, h: 48, face: 1, vy: 0, onGround: true, hiding: false, exposed: false, side: 1 };
+  const mod = (a, n) => ((a % n) + n) % n;
+  const hs = (a, b, c) => Math.abs(a * 7 + b * 13 + c * 5);
+
+  // ---------- 그리기 도우미 ----------
+  const R = (c, x, y, w, h) => { ctx.fillStyle = c; ctx.fillRect(x, y, w, h); };
+  const disc = (c, x, y, r) => { ctx.fillStyle = c; ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill(); };
+  const glow = (x, y, r, rgb, a) => {
+    const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+    g.addColorStop(0, `rgba(${rgb},1)`); g.addColorStop(1, `rgba(${rgb},0)`);
+    ctx.globalAlpha = a; ctx.fillStyle = g; ctx.fillRect(x - r, y - r, r * 2, r * 2); ctx.globalAlpha = 1;
+  };
+  const text = (t, x, y, size, col) => { ctx.font = `bold ${size}px sans-serif`; ctx.fillStyle = col; ctx.fillText(t, x, y); };
+  const poly = (c, pts) => { ctx.fillStyle = c; ctx.beginPath(); pts.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])); ctx.fill(); };
+  const far = f => (x, v) => { ctx.globalAlpha = .8; f(x, v); ctx.globalAlpha = 1; };
+  const rep = (P, par, off, fn) => { // 규칙적인 배경 무늬용
+    const s = camX * par, k0 = Math.floor((s - off) / P) - 1, k1 = Math.floor((s + W - off) / P) + 1;
+    for (let k = k0; k <= k1; k++) fn(k * P + off - s, k);
+  };
+
+  // =====================================================
+  // 랜덤 배치 엔진
+  // 스트림 = 한 줄로 놓이는 오브젝트 열. 정의(def) 중 하나를 가중치로 뽑고,
+  // 앞뒤 간격을 랜덤으로 띄워 배치. 같은 종류가 연달아 나오지 않도록 cool 적용.
+  // def: { w(폭 또는 함수), draw(x, v), weight, cool }
+  // =====================================================
+  function fill(s, hi) {
+    while (s.cur < hi) {
+      let cand = s.defs.map((d, i) => i).filter(i => s.since[i] >= (s.defs[i].cool || 1));
+      if (!cand.length) cand = s.defs.map((d, i) => i);
+      let r = Math.random() * cand.reduce((a, i) => a + (s.defs[i].weight || 1), 0), idx = cand[cand.length - 1];
+      for (const i of cand) { r -= (s.defs[i].weight || 1); if (r <= 0) { idx = i; break; } }
+      const d = s.defs[idx], v = Math.floor(Math.random() * 1e6), w = (typeof d.w === 'function' ? d.w(v) : d.w) * (s.scale || 1);
+      const x = s.cur + s.gap[0] + Math.random() * (s.gap[1] - s.gap[0]);
+      s.items.push({ x, w, v, d, k: s.scale || 1 }); s.cur = x + w;
+      s.since = s.since.map(n => n + 1); s.since[idx] = 0;
+    }
+  }
+  // 터널 근처 장식 제거: avoid(여유 px)가 지정된 줄의 아이템은 터널 구조물 주변에서 그리지도, 시야를 막지도 않는다
+  function skipItem(s, it) {
+    if (s.avoid == null) return false;
+    const tz = streams.find(q => q.tunnel);
+    return !!tz && tz !== s && tz.items.some(t => it.x < t.x + t.w + s.avoid && it.x + it.w > t.x - s.avoid);
+  }
+  function drawStream(s) {
+    const lo = camX * s.par - 20, hi = camX * s.par + W / ZOOM + 20;
+    fill(s, hi + 400);
+    if (s.pre) s.pre();
+    for (const it of s.items) {
+      if (it.x > hi) break;
+      if (it.x + it.w < lo) continue;
+      if (skipItem(s, it)) continue;
+      const k = s.scale || 1, sx = it.x - camX * s.par; // 가구 배율: 바닥(G) 기준으로 확대
+      if (k !== 1) { ctx.save(); ctx.translate(sx, G); ctx.scale(k, k); ctx.translate(-sx, -G); }
+      it.d.draw(sx, it.v, it.w / k);
+      if (k !== 1) ctx.restore();
+    }
+  }
+
+  // =====================================================
+  // 장면 1: 모스크바 거리
+  // =====================================================
+  function onion(cx, by, w, h, col) {
+    ctx.fillStyle = col; ctx.beginPath(); ctx.moveTo(cx - w / 2, by);
+    ctx.bezierCurveTo(cx - w * .85, by - h * .4, cx - w * .1, by - h * .6, cx, by - h);
+    ctx.bezierCurveTo(cx + w * .1, by - h * .6, cx + w * .85, by - h * .4, cx + w / 2, by); ctx.fill();
+    R('#c9a24a', cx - 1, by - h - 9, 2, 9);
+  }
+  const BY = G - 20;
+  const skyDefs = [
+    { w: 160, weight: 1, cool: 4, draw: far(x => { const o = x + 80;
+        R('#9b6e5e', o - 70, BY - 50, 140, 50); R('#b58a73', o - 22, BY - 90, 44, 40);
+        onion(o, BY - 90, 40, 70, '#a8403a'); onion(o - 52, BY - 50, 28, 46, '#3f7d5a'); onion(o + 52, BY - 50, 28, 46, '#4a5f9a');
+        onion(o - 28, BY - 50, 24, 40, '#c9a24a'); onion(o + 28, BY - 50, 24, 40, '#7a4a8a'); }) },
+    { w: 180, weight: 1, cool: 4, draw: far(x => { const k = x + 90;
+        R('#8a4a40', k - 90, BY - 36, 180, 36); R('#8a4a40', k - 18, BY - 120, 36, 120);
+        poly('#6f8a6a', [[k - 24, BY - 120], [k, BY - 175], [k + 24, BY - 120]]); disc('#c0392b', k, BY - 182, 6); }) },
+    { w: 24, weight: 1, cool: 4, draw: far(x => { const t = x + 12;
+        poly('#8d9296', [[t - 8, BY], [t - 2, BY - 150], [t + 2, BY - 150], [t + 8, BY]]);
+        R('#8d9296', t - 11, BY - 150, 22, 10); R('#8d9296', t - 1, BY - 230, 2, 80); }) },
+    { w: 60, weight: 3, cool: 1, draw: far((x, v) => { const h = 140 + v % 120;
+        R('#8d9296', x, BY - h, 60, h); for (let i = 0; i < 5; i++) R('rgba(0,0,0,.15)', x + 6 + i * 11, BY - h, 2, h); }) },
+    { w: 44, weight: 2, cool: 2, draw: far(x => {
+        R('#7d8087', x + 14, BY - 170, 16, 170); for (let i = 0; i < 3; i++) R('#c0392b', x + 14, BY - 170 + i * 20, 16, 8);
+        ctx.fillStyle = 'rgba(220,220,220,.6)'; for (let i = 0; i < 3; i++) { ctx.beginPath(); ctx.ellipse(x + 30 + i * 12, BY - 180 - i * 14, 14, 8, 0, 0, 7); ctx.fill(); } }) },
+  ];
+
+  const BC = ['#8d8f8a', '#a39f93', '#7d8087', '#9a9588', '#b09a82'];
+  function panel(x, b, f, c0, sd, balc) { // 층고 2.7m(72px), 창 1.4x1.5m, 한 칸 3m(80px)
+    const h = f * 72, y = G - h, w = b * 80 + 8;
+    R(c0, x, y, w, h); R('rgba(0,0,0,.18)', x, y, w, 4);
+    for (let c = 1; c < b; c++) R('rgba(0,0,0,.08)', x + 4 + c * 80, y, 1, h);
+    for (let r = 0; r < f; r++) {
+      const fy = G - (r + 1) * 72; R('rgba(0,0,0,.1)', x, fy, w, 2);
+      for (let c = 0; c < b; c++) {
+        const wx = x + 4 + c * 80 + 22, q = hs(sd, r, c);
+        if (r === 0 && c === 1) { R('#555', wx - 4, G - 62, 44, 3); R('#3a3028', wx + 4, G - 56, 28, 56); disc('#c9a24a', wx + 28, G - 28, 2); continue; }
+        R('#e8e4d8', wx - 2, fy + 12, 40, 44); R(q % 4 === 0 ? '#e6c36a' : '#2b3640', wx, fy + 14, 36, 40);
+        if (q % 3 === 0) R(['#a84a4a', '#4a7a5a', '#c9a24a'][q % 2 + q % 3 % 2], wx, fy + 14, 12, 40);
+        R('rgba(0,0,0,.35)', wx + 17, fy + 14, 2, 40);
+        if (balc && c % 2 === 1 && r > 0) { R('#555', wx - 8, fy + 56, 52, 2); for (let k = 0; k < 6; k++) R('rgba(0,0,0,.4)', wx - 6 + k * 9, fy + 48, 1, 8); if (q % 3 === 1) R('#cfd8dc', wx + 6, fy + 36, 12, 12); }
+      }
+    }
+    R('#555', x + w * .3, y - 18, 2, 18); R('#555', x + w * .3 - 6, y - 14, 14, 2); R('#555', x + w * .6, y - 12, 2, 12); R('#555', x + w * .6 - 5, y - 9, 12, 2);
+  }
+  const blockDefs = [
+    { w: v => (3 + v % 3) * 80 + 8, weight: 4, draw: (x, v) => panel(x, 3 + v % 3, 3 + (v >> 3) % 3, BC[(v >> 6) % 5], v % 113, (v >> 9) % 2 === 0) },
+    { w: 248, weight: 1, cool: 3, draw: (x, v) => panel(x, 3, 9, BC[(v >> 6) % 5], v % 113, true) },
+    { w: 440, weight: 1, cool: 4, draw: (x, v) => { // 스탈린식 건물 (층고 3m)
+        const f = 5 + v % 2, fh = 80, h = f * fh, y = G - h, w = 440;
+        R('#c9b48a', x, y, w, h); R('#a8905a', x, y, w, 10); R('#8a7448', x, y + 10, w, 4);
+        for (let c = 0; c < 6; c++) {
+          R('#d8c9a0', x + 8 + c * 72, y + 14, 6, h - 14);
+          for (let r = 0; r < f; r++) {
+            const fy = G - (r + 1) * fh, wx = x + 22 + c * 72; if (r === 0 && c === 2) continue;
+            R('#e8e4d8', wx - 2, fy + 12, 34, 52); R(hs(v % 97, r, c) % 4 === 0 ? '#e6c36a' : '#2b3640', wx, fy + 14, 30, 48);
+          } }
+        R('#1c1c20', x + 160, G - 70, 40, 70); ctx.fillStyle = '#1c1c20'; ctx.beginPath(); ctx.arc(x + 180, G - 70, 20, Math.PI, 0); ctx.fill(); } },
+    { w: 330, weight: 1.5, cool: 2, draw: (x, v) => { // 차고 단지
+        for (let i = 0; i < 4; i++) { const c = ['#6a7f9a', '#8a6a44', '#6f8a6a', '#a8403a'][(v + i) % 4], gx = x + i * 82;
+          R(c, gx, G - 56, 80, 56); R('rgba(0,0,0,.25)', gx + 8, G - 46, 64, 46); R('#555', gx - 2, G - 60, 84, 5); } } },
+  ];
+
+  function streetBackground() {
+    const g = ctx.createLinearGradient(0, 0, 0, G);
+    g.addColorStop(0, '#8e989e'); g.addColorStop(1, '#cfcbbd');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, G);
+    ctx.fillStyle = 'rgba(255,255,255,.22)';
+    for (let i = 0; i < 5; i++) { const x = mod(i * 260 - camX * .08, W + 400) - 200; ctx.beginPath(); ctx.ellipse(x, 50 + (i * 31) % 70, 130, 22, 0, 0, 7); ctx.fill(); }
+  }
+  function streetGround() {
+    R('#3b3d40', 0, G, W, GROUND_H); R('#7b7a76', 0, G, W, 16); R('#5c5b58', 0, G + 16, W, 4);
+    rep(48, 1, 0, x => R('rgba(0,0,0,.2)', x, G, 2, 16));
+    rep(90, 1, 0, x => R('#c9c4a8', x, G + 52, 50, 4));
+  }
+  const streetFloor = [
+    { w: 50, weight: 2, cool: 2, draw: (x, v) => { // 자작나무 (약 6~8m)
+        const h = 150 + v % 60, t = x + 20;
+        R('#e4e0d4', t, G - h, 6, h); for (let i = 0; i < 6; i++) R('#2a2a2a', t, G - 30 - i * 24, 6, 2);
+        ctx.strokeStyle = '#5a4a3a'; ctx.lineWidth = 2; ctx.beginPath();
+        for (let i = 0; i < 6; i++) { const y = G - h + 20 + i * 18, d = i % 2 ? 1 : -1; ctx.moveTo(t + 3, y); ctx.lineTo(t + 3 + d * (22 - i * 2), y - 16); } ctx.stroke();
+        ctx.fillStyle = ['rgba(176,138,58,.5)', 'rgba(143,154,74,.5)', 'rgba(168,104,58,.5)'][v % 3];
+        for (let i = 0; i < 4; i++) { ctx.beginPath(); ctx.ellipse(t + 3 + (i % 2 ? 16 : -16), G - h + 10 + i * 12, 14, 6, 0, 0, 7); ctx.fill(); } } },
+    { w: 16, weight: 1.5, draw: x => { R('#3a3c3e', x, G - 24, 14, 24); R('#222', x - 1, G - 25, 16, 3); } },
+    { w: 100, weight: 2, cool: 3, draw: (x, v) => { // 매점 2.5m x 2.4m
+        const nm = ['ПИВО', 'ЦВЕТЫ', 'ГАЗЕТЫ', 'ПРОДУКТЫ'][v % 4], bc = ['#3d6b8c', '#6f8a6a', '#8a4a40', '#6a6a7a'][(v >> 2) % 4];
+        R(bc, x, G - 64, 66, 64); R('#d9b43c', x - 4, G - 70, 74, 6); R('#e8e2cf', x + 8, G - 46, 50, 18); R('#6b4a30', x + 8, G - 28, 50, 3);
+        text(nm, x + 8, G - 51, nm.length > 5 ? 8 : 10, '#f2f2f2');
+        R('#a8855a', x + 70, G - 16, 16, 16); if (v % 2) R('#8a6a44', x + 74, G - 32, 14, 16); } },
+    { w: 30, weight: 1, cool: 4, draw: x => { R('#b83a2e', x, G - 61, 28, 61); R('#a9c3c8', x + 4, G - 52, 20, 36); R('#222', x + 4, G - 12, 20, 3); R('#e8e2cf', x + 8, G - 57, 12, 3); } },
+    { w: 112, weight: 2.5, cool: 2, draw: (x, v) => { // 승용차 4.1m
+        const c = ['#8a8f7a', '#6a7f9a', '#a8403a', '#c9c4a8', '#5a6a4a'][v % 5];
+        R(c, x, G - 24, 109, 19); poly(c, [[x + 22, G - 24], [x + 34, G - 37], [x + 82, G - 37], [x + 96, G - 24]]);
+        poly('#9fb1b8', [[x + 27, G - 25], [x + 36, G - 34], [x + 56, G - 34], [x + 56, G - 25]]); poly('#9fb1b8', [[x + 60, G - 25], [x + 60, G - 34], [x + 80, G - 34], [x + 91, G - 25]]);
+        R('#333', x - 2, G - 10, 113, 4); R('#e6c36a', x + 104, G - 20, 5, 4);
+        disc('#1c1c1c', x + 22, G - 8, 8); disc('#1c1c1c', x + 88, G - 8, 8); disc('#777', x + 22, G - 8, 3); disc('#777', x + 88, G - 8, 3); } },
+    { w: 150, weight: 1, cool: 6, draw: x => { // 버스 정류장
+        R('#555', x, G - 67, 3, 67); R('#555', x + 107, G - 67, 3, 67); R('#444', x - 4, G - 70, 118, 4); R('rgba(170,190,195,.35)', x + 3, G - 64, 104, 50);
+        R('#6b4a30', x + 20, G - 12, 60, 3); R('#3a281d', x + 24, G - 9, 3, 9); R('#3a281d', x + 72, G - 9, 3, 9);
+        R('#555', x + 122, G - 80, 2, 80); R('#2f5f8f', x + 114, G - 96, 18, 18); text('А', x + 119, G - 82, 13, '#fff'); } },
+    { w: 84, weight: 1.5, cool: 3, draw: (x, v) => { // 광고판
+        const ad = ['ПЕЛЬМЕНИ', 'ЖВАЧКА', 'БАНК', 'ПИВО'][v % 4], bg = ['#c0392b', '#2f5f8f', '#3f7d5a', '#a8803a'][(v >> 2) % 4];
+        R('#444', x + 8, G - 80, 3, 80); R('#444', x + 69, G - 80, 3, 80); R('#222', x, G - 134, 80, 56); R(bg, x + 3, G - 131, 74, 50); text(ad, x + 8, G - 104, 12, '#f5d76e'); } },
+    { w: 56, weight: 2, draw: x => { R('#6b4a30', x, G - 12, 54, 3); R('#6b4a30', x, G - 24, 54, 3); R('#3a281d', x + 3, G - 24, 3, 24); R('#3a281d', x + 48, G - 24, 3, 24); } },
+    { w: 100, weight: 1.5, cool: 2, draw: x => { // 울타리 1.2m
+        R('#6b4a30', x, G - 28, 100, 3); R('#6b4a30', x, G - 14, 100, 3); for (let i = 0; i < 6; i++) R('#7a5a3a', x + 2 + i * 18, G - 32, 5, 32); } },
+    { w: 56, weight: 1, cool: 3, draw: (x, v) => { // 화단
+        R('#7a7a76', x, G - 16, 54, 16); R('#4a3a2a', x + 2, G - 18, 50, 4);
+        for (let i = 0; i < 6; i++) disc(['#c0392b', '#e6c36a', '#e8e2cf'][(v + i) % 3], x + 6 + i * 8, G - 22 - (i % 2) * 4, 3); } },
+    { w: 52, weight: 1, cool: 4, draw: x => { // 쓰레기 컨테이너 1.2m
+        R('#3f6a4a', x, G - 30, 48, 30); R('#2f5238', x - 2, G - 34, 52, 5); R('rgba(0,0,0,.25)', x + 4, G - 24, 40, 2); disc('#222', x + 8, G - 3, 3); disc('#222', x + 40, G - 3, 3); } },
+    { w: 40, weight: 1, cool: 4, draw: x => { // 자전거
+        ctx.strokeStyle = '#222'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(x + 8, G - 9, 8, 0, 7); ctx.arc(x + 32, G - 9, 8, 0, 7);
+        ctx.moveTo(x + 8, G - 9); ctx.lineTo(x + 18, G - 20); ctx.lineTo(x + 32, G - 9); ctx.moveTo(x + 18, G - 20); ctx.lineTo(x + 28, G - 22); ctx.stroke(); } },
+  ];
+  const lampDef = { w: 30, draw: x => { R('#2f3336', x, G - 150, 3, 150); R('#2f3336', x, G - 150, 24, 3); R('#cfc9a8', x + 18, G - 148, 14, 5); R('#2f3336', x - 3, G - 10, 9, 10); } };
+
+  // =====================================================
+  // 장면 2: 카페 (아파트 1층, 층고 3.2m)
+  // =====================================================
+  const CAFE_C = G - m(3.2);
+  function cafeBackground() {
+    const C = CAFE_C;
+    R('#26272a', 0, 0, W, C - 22); R('#3a3b3d', 0, C - 22, W, 14); R('#d8d0b8', 0, C - 8, W, 8);
+    R('#7a5a45', 0, C + 5, W, G - C - 5);
+    rep(24, 1, 0, x => R('rgba(0,0,0,.07)', x, C + 5, 12, G - C - 5));
+    R('#b9ad8c', 0, C, W, 5); R('rgba(0,0,0,.18)', 0, C + 5, W, 2);
+    R('#2f4a3a', 0, G - m(1), W, m(1)); R('#c9c4a8', 0, G - m(1), W, 2);
+  }
+  const cafeWall = [
+    { w: 52, weight: 3, cool: 1, draw: (x, v) => {
+        const wh = m(1.3), y = G - m(.9) - wh, cc = ['#8a2f2f', '#2f4a6a', '#6a5a2a', '#4a6a3a'][v % 4];
+        R('#2d1f16', x - 3, y - 3, 46, wh + 6); R('#aab4b8', x, y, 40, wh);
+        R('#8d8f8a', x + 4, y + 14, 10, 21); R('#9a9588', x + 18, y + 8, 12, 27); R('#7d8087', x + 32, y + 16, 6, 19);
+        R('#2d1f16', x + 19, y, 2, wh); R(cc, x - 3, y - 3, 9, wh + 6); R(cc, x + 34, y - 3, 9, wh + 6);
+        R('#cfc9b8', x + 4, G - 21, 32, 14); for (let i = 0; i < 8; i++) R('rgba(0,0,0,.2)', x + 8 + i * 4, G - 21, 1, 14); } },
+    { w: 40, weight: 1.5, draw: (x, v) => { R('#1d2a22', x, G - 60, 34, 18); for (let i = 0; i < 4; i++) R('rgba(255,255,255,.6)', x + 4, G - 56 + i * 4, 14 + (v + i * 7) % 12, 1); } },
+    { w: 16, weight: 1, draw: x => { disc('#eee', x + 8, CAFE_C + 22, 7); R('#222', x + 8, CAFE_C + 16, 1, 6); R('#222', x + 8, CAFE_C + 22, 4, 1); } },
+    { w: 20, weight: 2, draw: (x, v) => { R('#3a281d', x, G - 70, 14, 18); R(['#c9b48a', '#8aa0a8', '#a8886a'][v % 3], x + 2, G - 68, 10, 14); R('#7a5a45', x + 5, G - 65, 4, 6); } },
+    { w: 52, weight: 1, cool: 5, draw: x => text('КАФЕ', x, CAFE_C + 30, 13, '#ffb36b') },
+    { w: 26, weight: 1.5, draw: (x, v) => { R('#e8e2cf', x, G - 72, 20, 28); R(['#c0392b', '#2f5f8f', '#3f7d5a'][v % 3], x + 2, G - 70, 16, 10); R('#999', x + 3, G - 56, 14, 1); R('#999', x + 3, G - 52, 10, 1); } },
+    { w: 62, weight: 1, cool: 3, draw: x => { R('#5a3a28', x, G - 56, 60, 3); for (let i = 0; i < 5; i++) { R('#e8e2cf', x + 4 + i * 11, G - 66, 8, 10); R('#6a7f9a', x + 6 + i * 11, G - 64, 4, 4); } } },
+    { w: 34, weight: 1, cool: 4, draw: x => { R('#c9a24a', x - 2, G - 74, 38, 46); R('#9fb1b8', x + 1, G - 71, 32, 40); R('rgba(255,255,255,.3)', x + 4, G - 68, 8, 30); } },
+    { w: 12, weight: 1.5, draw: x => { R('#c9a24a', x + 3, G - 56, 6, 8); glow(x + 6, G - 56, 30, '255,200,120', .5); } },
+    { w: 14, weight: 1, cool: 3, draw: x => { R('#6a4a38', x, CAFE_C + 5, 14, G - CAFE_C - 5); R('#2f4a3a', x, G - m(1), 14, m(1)); R('rgba(0,0,0,.2)', x + 11, CAFE_C + 5, 3, G - CAFE_C - 5); } },
+  ];
+  const cafeCeil = [
+    { w: 14, weight: 3, draw: x => { R('#222', x + 7, CAFE_C, 1, 20); R('#c9a24a', x + 1, CAFE_C + 20, 13, 5); glow(x + 7, CAFE_C + 30, 46, '255,200,120', .5); } },
+    { w: 32, weight: 2, draw: x => R('#fff6d8', x, CAFE_C - 4, 32, 4) },
+    { w: 44, weight: 1, cool: 3, draw: x => { R('#444', x + 21, CAFE_C, 2, 10); R('#6a4a38', x, CAFE_C + 10, 44, 3); } },
+    { w: 12, weight: 2, draw: x => R('#5a4030', x, CAFE_C, 12, 7) },
+  ];
+  const cafeFloor = [
+    { w: 58, weight: 4, cool: 1, draw: (x, v) => { const t = x + 14, c = ['#8a2f2f', '#2f4a6a', '#6a5a2a'][v % 3];
+        R('#5a3a28', t, G - 20, 27, 3); R('#3a281d', t + 12, G - 17, 3, 17); R('#3a281d', t + 6, G - 2, 15, 2);
+        if (v % 3) R('#eee', t + 10, G - 24, 4, 4); else R('#c9a24a', t + 9, G - 27, 6, 7);
+        R(c, x, G - 12, 11, 3); R('#3a281d', x + 1, G - 9, 2, 9); R('#3a281d', x + 9, G - 9, 2, 9); R('#3a281d', x, G - 24, 2, 12);
+        R(c, x + 44, G - 12, 11, 3); R('#3a281d', x + 45, G - 9, 2, 9); R('#3a281d', x + 53, G - 9, 2, 9); R('#3a281d', x + 53, G - 24, 2, 12); } },
+    { w: 34, weight: 2, draw: (x, v) => { R('#5a3a28', x + 12, G - 19, 16, 3); R('#3a281d', x + 19, G - 16, 2, 16); R('#3a281d', x + 14, G - 2, 12, 2);
+        R('#2f4a6a', x + 30, G - 12, 4, 12); R('#2f4a6a', x, G - 12, 10, 3); R('#3a281d', x + 1, G - 9, 2, 9); R('#3a281d', x, G - 24, 2, 12); R('#eee', x + 18, G - 23, 4, 4); } },
+    { w: 92, weight: 1.5, cool: 3, draw: x => { // 부스석
+        R('#6a2f2f', x, G - 32, 8, 32); R('#8a3a3a', x, G - 12, 24, 3); R('#3a281d', x + 2, G - 9, 18, 9);
+        R('#5a3a28', x + 28, G - 20, 34, 3); R('#3a281d', x + 43, G - 17, 3, 17);
+        R('#6a2f2f', x + 82, G - 32, 8, 32); R('#8a3a3a', x + 66, G - 12, 24, 3); R('#3a281d', x + 70, G - 9, 18, 9); R('#eee', x + 42, G - 24, 4, 4); } },
+    { w: 142, weight: 1, cool: 7, draw: x => { // 바 카운터 + 냉장고
+        R('#5a3a28', x + 8, G - 52, 90, 2); for (let i = 0; i < 6; i++) R(['#4a7a5a', '#a8403a', '#c9a24a'][i % 3], x + 12 + i * 14, G - 60, 5, 8);
+        R('#3a281d', x, G - 29, 107, 29); R('#8a6a50', x - 2, G - 31, 111, 3);
+        R('#b7b2a0', x + 10, G - 40, 10, 9); R('#c9a24a', x + 40, G - 42, 9, 11); R('#e8e2cf', x + 70, G - 37, 8, 6);
+        R('#d8d6cc', x + 114, G - 48, 22, 48); R('#999', x + 130, G - 38, 2, 12);
+        for (let i = 0; i < 3; i++) { const sx = x + 14 + i * 34; R('#8a2f2f', sx, G - 17, 9, 3); R('#3a281d', sx + 3, G - 14, 2, 14); } } },
+    { w: 18, weight: 2, draw: x => { R('#8a4a30', x + 4, G - 8, 10, 8); ctx.fillStyle = '#3f7d5a'; for (let i = 0; i < 5; i++) { ctx.beginPath(); ctx.ellipse(x + 9 + (i - 2) * 4, G - 18 - (i % 2) * 6, 3, 10, (i - 2) * .25, 0, 7); ctx.fill(); } } },
+    { w: 20, weight: 1, cool: 3, draw: x => { R('#3a281d', x + 9, G - 45, 2, 45); R('#3a281d', x + 3, G - 4, 14, 4); for (let i = 0; i < 3; i++) R('#3a281d', x + 5 + i * 4, G - 44, 2, 5); R('#555', x + 2, G - 38, 8, 14); } },
+    { w: 34, weight: 1, cool: 6, draw: x => { R('#3a281d', x, G - 56, 28, 56); R('#6b4a30', x + 2, G - 54, 24, 54); R('#9fb1b8', x + 7, G - 48, 14, 18); disc('#c9a24a', x + 22, G - 27, 2); } },
+    { w: 26, weight: 1, cool: 5, draw: x => { R('#7a2f3a', x, G - 37, 24, 37); ctx.fillStyle = '#7a2f3a'; ctx.beginPath(); ctx.arc(x + 12, G - 37, 12, Math.PI, 0); ctx.fill();
+        R('#e6c36a', x + 4, G - 30, 16, 14); R('#2f5f8f', x + 4, G - 12, 5, 5); R('#c0392b', x + 15, G - 12, 5, 5); } },
+    { w: 46, weight: 1, cool: 7, draw: x => { R('#222', x, G - 32, 40, 32); R('#eee', x + 2, G - 20, 36, 3); R('#222', x + 4, G - 4, 3, 4); R('#222', x + 33, G - 4, 3, 4); R('#3a281d', x + 12, G - 13, 14, 3); R('#3a281d', x + 17, G - 10, 3, 10); } },
+    { w: 38, weight: 1.5, cool: 3, draw: (x, v) => { R('#5a3a28', x, G - 48, 36, 48);
+        for (let r = 0; r < 4; r++) { R('#3a281d', x + 2, G - 12 - r * 11, 32, 1); for (let i = 0; i < 7; i++) R(['#8a2f2f', '#2f4a6a', '#c9a24a', '#3f7d5a'][(v + i + r) % 4], x + 3 + i * 4, G - 22 - r * 11, 3, 9); } } },
+    { w: 44, weight: 1.5, cool: 3, draw: x => { R('#5a3a28', x, G - 27, 40, 27); R('#3a281d', x + 19, G - 25, 1, 25); R('#7a5a3a', x + 3, G - 24, 14, 20); R('#7a5a3a', x + 23, G - 24, 14, 20);
+        for (let i = 0; i < 3; i++) R('#e8e2cf', x + 6 + i * 11, G - 32, 7, 5); } },
+    { w: 16, weight: 1.5, draw: x => { R('#3a3c3e', x, G - 24, 14, 24); R('#222', x, G - 24, 14, 3); } },
+  ];
+  function cafeGround() {
+    R('#6b4a30', 0, G, W, GROUND_H); R('#3a281d', 0, G, W, 6);
+    rep(70, 1, 0, x => R('rgba(0,0,0,.25)', x, G + 6, 2, GROUND_H - 6));
+    R('rgba(0,0,0,.18)', 0, G + 36, W, 2); R('rgba(0,0,0,.18)', 0, G + 62, W, 2);
+  }
+
+  // =====================================================
+  // 장면 3: 지하철역 (중앙홀 높이 8m)
+  // =====================================================
+  const SUB_C = G - m(8);
+  function subwayBackground() {
+    const C = SUB_C, g = ctx.createLinearGradient(0, 0, 0, C);
+    g.addColorStop(0, '#b9ad8c'); g.addColorStop(1, '#e2d9bf'); ctx.fillStyle = g; ctx.fillRect(0, 0, W, C + 1);
+    R('#fff0c0', 0, C - 6, W, 4);
+    R('#c9c0a4', 0, C, W, G - C); rep(27, .3, 0, x => R('rgba(0,0,0,.07)', x, C, 1, G - C));
+    R('#2b6f4a', 0, G - m(3.8), W, 6);
+  }
+  const subTrain = [
+    { w: 520, weight: 3, cool: 1, draw: (x, v) => { const c = ['#2f5f8f', '#2f5f8f', '#3f6a4a'][v % 3];
+        R('#1d3b5a', x, G - 98, 520, 6); R(c, x, G - 92, 520, 86); R('#e8e2cf', x, G - 40, 520, 5);
+        for (let i = 0; i < 3; i++) { R('#9aa3a6', x + 30 + i * 170, G - 55, 35, 49); R('#f0e3a8', x + 80 + i * 170, G - 80, 60, 26); } } },
+    { w: 200, weight: 1, cool: 1, draw: x => { R('#101014', x, G - 100, 200, 100); R('#333', x, G - 80, 200, 2); R('#333', x, G - 60, 200, 2); R('#777', x, G - 6, 200, 2); } },
+  ];
+  const subBay = [{ w: 168, draw: (x, v) => {
+      const C = SUB_C, cy = G - 112;
+      R('rgba(0,0,0,.07)', x + 6, 10, 156, C - 24);
+      ctx.fillStyle = '#d9d0b6'; ctx.beginPath(); ctx.rect(x + 48, C, 120, G - C);
+      ctx.moveTo(x + 48, G); ctx.lineTo(x + 48, cy); ctx.arc(x + 108, cy, 60, Math.PI, 0); ctx.lineTo(x + 168, G); ctx.closePath(); ctx.fill('evenodd');
+      ctx.strokeStyle = '#b9ad8c'; ctx.lineWidth = 4; ctx.beginPath(); ctx.moveTo(x + 48, G); ctx.lineTo(x + 48, cy); ctx.arc(x + 108, cy, 60, Math.PI, 0); ctx.lineTo(x + 168, G); ctx.stroke();
+      R('#e8e1ce', x, C, 48, G - C); R('rgba(0,0,0,.1)', x + 40, C, 8, G - C); R('#7a7468', x, G - 20, 48, 20);
+      R('#c9a24a', x + 20, C + 90, 8, 12); glow(x + 24, C + 96, 34, '255,225,150', .45);
+      if (v % 3 === 0) text('ВОКЗАЛЬНАЯ', x + 52, C + 26, 12, '#7a5a2a');
+      R('#444', x + 108, C - 20, 1, 30); R('#c9a24a', x + 92, C + 10, 32, 3);
+      for (let i = 0; i < 5; i++) R('#ffe9a0', x + 94 + i * 7, C + 6, 3, 4);
+      glow(x + 108, C + 12, 60, '255,225,150', .5); } }];
+  const subHang = [
+    { w: 90, weight: 2, cool: 2, draw: x => { const C = SUB_C; R('#444', x + 10, C, 1, G - m(3) - C); R('#444', x + 70, C, 1, G - m(3) - C); R('#1f6f4a', x, G - m(3), 80, 18); text('ВЫХОД В ГОРОД', x + 5, G - m(3) + 13, 9, '#fff'); } },
+    { w: 44, weight: 1.5, cool: 2, draw: x => { R('#444', x + 20, SUB_C, 1, G - 100 - SUB_C); R('#111', x, G - 100, 40, 14); text('1:36', x + 6, G - 89, 12, '#e33'); } },
+    { w: 66, weight: 1.5, cool: 2, draw: x => { R('#444', x + 10, SUB_C, 1, G - m(3.2) - SUB_C); R('#444', x + 54, SUB_C, 1, G - m(3.2) - SUB_C); R('#111', x, G - m(3.2), 64, 24); for (let i = 0; i < 3; i++) R('#e8b84a', x + 4, G - m(3.2) + 4 + i * 6, 40 - i * 6, 2); } },
+    { w: 34, weight: 1, cool: 3, draw: x => { R('#444', x + 16, SUB_C, 2, G - m(3.3) - SUB_C); R('#c0392b', x + 4, G - m(3.3), 26, 22); text('М', x + 10, G - m(3.3) + 18, 18, '#fff'); } },
+    { w: 56, weight: 1.5, cool: 2, draw: (x, v) => { R('#444', x + 8, SUB_C, 1, G - 96 - SUB_C); R('#444', x + 26, SUB_C, 1, G - 96 - SUB_C); R('#222', x, G - 96, 34, 50); R('#fff6d8', x + 2, G - 94, 30, 46); R(['#c0392b', '#2f5f8f', '#3f7d5a'][v % 3], x + 4, G - 92, 26, 18); R('#888', x + 5, G - 70, 20, 2); R('#888', x + 5, G - 64, 14, 2); } },
+  ];
+  const subFloor = [
+    { w: 56, weight: 3, draw: x => { R('#6b4a30', x, G - 12, 53, 3); R('#6b4a30', x, G - 24, 53, 3); R('#3a281d', x + 3, G - 24, 3, 24); R('#3a281d', x + 47, G - 24, 3, 24); } },
+    { w: 16, weight: 1.5, draw: x => { R('#3a3c3e', x, G - 24, 14, 24); R('#222', x, G - 24, 14, 3); } },
+    { w: 36, weight: 1.5, cool: 3, draw: x => { R('#444', x + 14, G - 20, 4, 20); R('#2f5f8f', x, G - 58, 32, 38); R('#c0392b', x + 4, G - 48, 24, 2); R('#2e8b57', x + 6, G - 52, 2, 26); R('#fff', x + 4, G - 36, 24, 1); } },
+    { w: 66, weight: 1, cool: 5, draw: x => { for (let i = 0; i < 3; i++) { R('#555', x + i * 22, G - 27, 6, 27); R('#aaa', x + i * 22 + 6, G - 24, 14, 2); } } },
+    { w: 64, weight: 1, cool: 5, draw: x => { R('#6a7f9a', x, G - 60, 56, 60); R('#e8e2cf', x + 8, G - 44, 40, 16); text('ГАЗЕТЫ', x + 9, G - 49, 10, '#fff'); R('#c0392b', x - 3, G - 66, 62, 6); } },
+    { w: 30, weight: 1.5, cool: 3, draw: (x, v) => { R(['#2f5f8f', '#a8403a'][v % 2], x, G - 48, 26, 48); R('#cfd8dc', x + 3, G - 42, 20, 22); R('#222', x + 4, G - 14, 18, 4); R('#e6c36a', x + 6, G - 36, 6, 6); } },
+    { w: 34, weight: 1, cool: 4, draw: x => { R('#8a6a2a', x, G - 50, 30, 50); R('#222', x + 4, G - 44, 22, 14); R('#7ec97a', x + 6, G - 42, 18, 10); R('#555', x + 8, G - 24, 14, 3); } },
+    { w: 56, weight: 1, cool: 5, draw: x => { ctx.fillStyle = '#d9b43c'; ctx.beginPath(); ctx.ellipse(x + 28, G - 20, 22, 11, 0, 0, 7); ctx.fill();
+        R('#555', x + 6, G - 6, 3, 6); R('#555', x + 44, G - 6, 3, 6); disc('#222', x + 12, G - 4, 4); disc('#222', x + 42, G - 4, 4); text('КВАС', x + 14, G - 17, 9, '#222'); } },
+    { w: 48, weight: 1, cool: 4, draw: (x, v) => { R('#6b4a30', x, G - 20, 44, 3); R('#3a281d', x + 4, G - 17, 3, 17); R('#3a281d', x + 36, G - 17, 3, 17);
+        for (let i = 0; i < 3; i++) { R('#888', x + 4 + i * 14, G - 33, 10, 13); for (let j = 0; j < 3; j++) disc(['#c0392b', '#e6c36a', '#e8e2cf'][(v + i + j) % 3], x + 6 + i * 14 + j * 3, G - 36 - j, 3); } } },
+  ];
+  function subwayGround() {
+    R('#8c8470', 0, G, W, GROUND_H); R('#d8b53c', 0, G, W, 5);
+    rep(64, 1, 0, x => R('rgba(0,0,0,.18)', x, G + 5, 2, GROUND_H - 5)); R('rgba(0,0,0,.18)', 0, G + 40, W, 2);
+  }
+
+  // =====================================================
+  // 장면 4: 지하 작업실 (층고 3.4m, 위쪽은 흙 단면)
+  // =====================================================
+  const WS_C = G - m(3.4);
+  function workshopBackground() {
+    const C = WS_C, e = ctx.createLinearGradient(0, 0, 0, C);
+    e.addColorStop(0, '#3b2a1e'); e.addColorStop(1, '#5a4330'); ctx.fillStyle = e; ctx.fillRect(0, 0, W, C);
+    rep(120, 1, 0, (x, k) => { ctx.fillStyle = `rgba(0,0,0,${.12 + (hs(k, 1, 1) % 3) * .05})`; ctx.beginPath(); ctx.ellipse(x + 30, 30 + hs(k, 2, 2) % 120, 10 + hs(k, 3, 1) % 14, 6, 0, 0, 7); ctx.fill(); });
+    R('#2f3a3d', 0, 40, W, 14); rep(200, 1, 50, x => R('#222', x, 36, 6, 22)); R('#111', 0, 100, W, 4); R('#7a7872', 0, C - 18, W, 18);
+    const g = ctx.createLinearGradient(0, C, 0, G); g.addColorStop(0, '#4a4d4f'); g.addColorStop(1, '#5d6063'); ctx.fillStyle = g; ctx.fillRect(0, C, W, G - C);
+    for (let y = C + 11; y < G; y += 11) R('rgba(0,0,0,.18)', 0, y, W, 1);
+    rep(24, 1, 0, (x, k) => { for (let r = 0; r < 8; r++) if ((r + k) % 2) R('rgba(0,0,0,.18)', x, C + r * 11, 1, 11); });
+    R('#3d5a4a', 0, G - m(1.5), W, m(1.5)); R('#c9c4a8', 0, G - m(1.5), W, 2);
+    R('#6b4a3a', 0, C + 4, W, 5); R('#7d5a46', 0, C + 4, W, 2); R('#5a6a70', 0, C + 13, W, 3); R('#333', 0, C + 20, W, 3);
+    rep(160, 1, 40, x => R('#2a2a2a', x, C + 2, 4, 16));
+  }
+  const wsWall = [
+    { w: 20, weight: 1.5, draw: x => { R('#8d9296', x, G - 60, 16, 21); R('#555', x + 2, G - 58, 12, 17); R('#c0392b', x + 12, G - 52, 2, 6); } },
+    { w: 12, weight: 1, draw: x => { R('#e8e2cf', x, G - 62, 9, 12); R('#c0392b', x, G - 62, 9, 3); } },
+    { w: 18, weight: 1.5, draw: x => { R('#e8e2cf', x, G - 66, 16, 22); R('#2f5f8f', x + 2, G - 64, 12, 6); R('#bbb', x + 3, G - 55, 10, 1); R('#bbb', x + 3, G - 51, 8, 1); } },
+    { w: 10, weight: 1, draw: x => { R('#b83a2e', x, G - 58, 6, 14); R('#222', x + 1, G - 61, 4, 3); } },
+    { w: 14, weight: 1, draw: x => { disc('#eee', x + 7, WS_C + 40, 6); R('#222', x + 7, WS_C + 35, 1, 5); R('#222', x + 7, WS_C + 40, 4, 1); } },
+    { w: 68, weight: 2, cool: 2, draw: x => { R('#7a6a4a', x, G - 62, 64, 30); for (let i = 0; i < 6; i++) R('#a0a4a8', x + 6 + i * 9, G - 58, 2, 14 + (i % 3) * 3); } },
+    { w: 52, weight: 1.5, cool: 2, draw: (x, v) => { R('#4a3a2a', x, G - 54, 50, 2); for (let i = 0; i < 4; i++) { R('rgba(180,200,190,.6)', x + 3 + i * 12, G - 66, 9, 12); R(['#a8855a', '#c0a050'][(v + i) % 2], x + 3 + i * 12, G - 60, 9, 6); } } },
+    { w: 34, weight: 1.5, cool: 3, draw: x => { R('#222', x, WS_C + 28, 27, 12); R('#9fb1b8', x + 2, WS_C + 30, 23, 8); R('#333', x + 9, WS_C + 30, 1, 8); R('#333', x + 17, WS_C + 30, 1, 8); } },
+    { w: 16, weight: 1, cool: 3, draw: x => { R('#6a4a30', x, G - 60, 14, 10); R('#999', x + 2, G - 58, 5, 5); R('#333', x + 9, G - 58, 3, 6); } },
+    { w: 26, weight: 1, cool: 4, draw: x => { R('#cfd8dc', x, G - 70, 24, 18); R('#2f5f8f', x + 3, G - 66, 18, 1); R('#2f5f8f', x + 3, G - 62, 12, 1); R('#2f5f8f', x + 3, G - 58, 16, 1); } },
+  ];
+  const wsCeil = [
+    { w: 8, weight: 3, draw: x => { R('#111', x + 3, WS_C + 23, 1, 12); disc('#ffe9a0', x + 3, WS_C + 38, 3); glow(x + 3, WS_C + 38, 70, '255,220,140', .4 + .08 * Math.sin(performance.now() / 110 + x)); } },
+    { w: 36, weight: 1.5, draw: x => { R('#444', x + 4, WS_C + 22, 1, 6); R('#444', x + 31, WS_C + 22, 1, 6); R('#e8e8e0', x, WS_C + 28, 36, 4); glow(x + 18, WS_C + 34, 50, '230,240,255', .3); } },
+    { w: 12, weight: 1, cool: 2, draw: x => { R('#c0392b', x + 5, WS_C - 2, 2, 8); disc('#c0392b', x + 6, WS_C - 2, 5); } },
+    { w: 16, weight: 1, cool: 3, draw: x => { R('#444', x + 7, WS_C + 23, 2, 20); ctx.strokeStyle = '#777'; ctx.lineWidth = 1.5; ctx.strokeRect(x + 3, WS_C + 43, 10, 6); } },
+  ];
+  const wsFloor = [
+    { w: 68, weight: 3, cool: 2, draw: x => { R('#6b5338', x, G - 24, 64, 3); R('#3a3c3e', x + 3, G - 21, 3, 21); R('#3a3c3e', x + 58, G - 21, 3, 21); R('#3a3c3e', x + 8, G - 20, 22, 8); R('#2f5f8f', x + 48, G - 31, 7, 7); R('#a0a4a8', x + 26, G - 27, 8, 3); } },
+    { w: 44, weight: 2, cool: 2, draw: (x, v) => { R('#3a3c3e', x, G - 53, 2, 53); R('#3a3c3e', x + 38, G - 53, 2, 53);
+        for (let i = 0; i < 4; i++) R('#4a3a2a', x, G - 1 - i * 17, 40, 2);
+        for (let i = 0; i < 3; i++) { R((v + i) % 2 ? '#a8855a' : '#8a6a44', x + 4, G - 29 - i * 17 + 6, 11, 11); R((v + i) % 2 ? '#8a6a44' : '#a8855a', x + 20, G - 24 - i * 17 + 9, 14, 8); } } },
+    { w: v => 16 * (1 + v % 3) + 2 * (v % 3), weight: 2, draw: (x, v) => { for (let i = 0; i <= v % 3; i++) { const bx = x + i * 18; R(['#2f5f8f', '#a8403a', '#3f6a4a'][(v + i) % 3], bx, G - 24, 16, 24); R('rgba(0,0,0,.3)', bx, G - 17, 16, 2); R('rgba(0,0,0,.3)', bx, G - 7, 16, 2); } } },
+    { w: 20, weight: 1, cool: 3, draw: x => { R('#b83a2e', x, G - 37, 7, 37); R('#555', x + 2, G - 41, 3, 4); R('#b83a2e', x + 10, G - 37, 7, 37); R('#555', x + 12, G - 41, 3, 4); } },
+    { w: 58, weight: 1, cool: 7, draw: x => { R('#3a3c3e', x + 2, G - 22, 4, 22); R('#3a3c3e', x + 48, G - 22, 4, 22); R('#3f5a4a', x, G - 32, 54, 10); R('#3f5a4a', x, G - 44, 15, 12); disc('#bbb', x + 18, G - 38, 5); R('#888', x + 42, G - 40, 8, 8); } },
+    { w: 22, weight: 1, cool: 4, draw: x => { R('#555', x + 8, G - 43, 3, 43); R('#555', x, G - 4, 20, 4); R('#3f5a4a', x + 3, G - 43, 14, 8); R('#999', x + 12, G - 30, 2, 8); } },
+    { w: v => 18 + (v % 2) * 14, weight: 2, draw: (x, v) => { R('#a8855a', x, G - 16, 16, 16); R('rgba(0,0,0,.3)', x, G - 8, 16, 1); if (v % 2) R('#8a6a44', x + 18, G - 16, 12, 12); else R('#8a6a44', x + 2, G - 30, 13, 14); } },
+    { w: 34, weight: 1, cool: 6, draw: x => { R('#2a2a2a', x - 2, G - 58, 32, 58); R('#4a5a50', x, G - 56, 28, 56); R('#222', x + 9, G - 48, 10, 8); disc('#c9a24a', x + 22, G - 27, 2); } },
+    { w: 26, weight: 1.5, cool: 3, draw: x => { R('#3f5a4a', x, G - 37, 24, 37); R('#2f4a3a', x + 2, G - 34, 20, 7); R('#2f4a3a', x + 2, G - 25, 20, 7); R('#2f4a3a', x + 2, G - 16, 20, 7); R('#c9c4a8', x + 17, G - 31, 3, 1); } },
+    { w: 36, weight: 1, cool: 5, draw: x => { R('#5a6a4a', x, G - 24, 34, 20); R('#3a3c3e', x + 3, G - 4, 4, 4); R('#3a3c3e', x + 27, G - 4, 4, 4); R('#222', x + 4, G - 20, 12, 6); R('#c0392b', x + 22, G - 20, 8, 5); } },
+    { w: 24, weight: 1, cool: 4, draw: x => { for (let i = 0; i < 3; i++) { ctx.fillStyle = '#1c1c1c'; ctx.beginPath(); ctx.ellipse(x + 11, G - 3 - i * 7, 11, 3.5, 0, 0, 7); ctx.fill(); } } },
+    { w: 24, weight: 1, cool: 4, draw: x => { ctx.strokeStyle = '#a8855a'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(x + 2, G); ctx.lineTo(x + 10, G - 48); ctx.moveTo(x + 20, G); ctx.lineTo(x + 12, G - 48); ctx.stroke(); for (let i = 0; i < 5; i++) R('#a8855a', x + 4 + i * 1, G - 8 - i * 9, 14 - i * 2, 2); } },
+    { w: 18, weight: 1.5, draw: x => { R('#555', x + 2, G - 13, 12, 13); R('#8a6a44', x, G - 15, 16, 3); R('#a0a4a8', x + 4, G - 19, 8, 4); } },
+  ];
+  function workshopGround() {
+    R('#55575a', 0, G, W, GROUND_H); R('#3a3c3e', 0, G, W, 6);
+    rep(120, 1, 0, x => R('rgba(0,0,0,.25)', x, G + 6, 2, GROUND_H - 6));
+    rep(300, 1, 90, x => { ctx.fillStyle = 'rgba(0,0,0,.25)'; ctx.beginPath(); ctx.ellipse(x, G + 40, 36, 8, 0, 0, 7); ctx.fill(); });
+    rep(600, 1, 300, x => R('#222', x, G + 10, 22, 3));
+  }
+
+  // =====================================================
+  // 등록된 장면 목록. 새 장면은 { name, background, ground, streams } 를 추가하면
+  // 랜덤 후보에 자동으로 들어갑니다. streams는 그리는 순서대로 나열합니다.
+  // =====================================================
+  // 가구 깊이(m): 실제 가구의 두께. 깊을수록 그림자가 진해집니다. 배열 순서 = 각 맵 가구 정의 순서
+  const setDepth = (defs, list) => defs.forEach((d, i) => { d.depth = list[i]; });
+  // 숨을 수 있는 가구/장식품(hide: true). 실제로는 높이가 플레이어 눈높이(38px) 이상, 폭 14px 이상인 것만 숨을 수 있음(그보다 낮은 가구는 못 숨음). 배열 숫자 = 각 맵 가구 정의 순서(index)
+  const setHide = (defs, idx) => idx.forEach(i => { defs[i].hide = true; });
+  cafeFloor[6].noShadow = true; wsFloor[7].noShadow = true; // 문: 그림자를 만들지 않고(시선을 막지 않음) 숨을 수도 없음
+  const FURN = 1.3; // 바닥에 놓이는 가구/소품 전체 크기 배율 (폭, 높이, 배치 간격이 같이 커짐)
+  setHide(streetFloor, [2, 3, 4, 5, 10]); // 매점, 전화부스, 자동차, 버스 정류장, 쓰레기 컨테이너
+  setHide(cafeFloor, [2, 3, 7, 8, 9]);    // 부스석, 카운터, 주크박스, 피아노, 책장
+  setHide(subFloor, [4, 5, 6]);           // 신문 가판대, 자판기, 매표기
+  setHide(wsFloor, [1, 4, 8]);            // 선반, 선반기, 공구 캐비닛
+  setDepth(streetFloor, [.3, .4, 2, 1, 1.7, .6, .2, .5, .1, .6, 1.2, .15]); // 나무, 통, 매점, 전화부스, 자동차, 정류장, 광고판, 벤치, 울타리, 화단, 컨테이너, 자전거
+  setDepth(cafeFloor, [.7, .6, 1, .7, .3, .2, .1, .6, .6, .35, .45, .4]);  // 테이블세트, 소형테이블, 부스, 카운터, 화분, 옷걸이, 문, 주크박스, 피아노, 책장, 찬장, 통
+  setDepth(subFloor, [.5, .4, .15, .7, 1.5, .8, .5, .8, .6]);              // 벤치, 통, 노선도, 개찰구, 가판대, 자판기, 매표기, 크바스, 꽃가판대
+  setDepth(wsFloor, [.7, .4, .6, .25, .8, .5, .6, .1, .5, .6, .65, .1, .4]); // 작업대, 선반, 드럼통, 가스통, 선반기, 드릴, 상자, 문, 공구장, 발전기, 타이어, 사다리, 모루
+  // --- 지하철 위험요소: 30초마다 터널에서 열차가 (사람이 보는 방향 = 화면 앞쪽으로) 달려온다 ---
+  // 열차는 깊이 z(m)로 움직인다. z=0이 터널 입구(= 플레이어가 서 있는 벽 평면), 카메라 쪽이 음수, 터널 안쪽이 양수.
+  // 원근 배율 s = F/(F+z). 카메라는 열차 지붕보다 훨씬 높아서(K) 열차가 가까워질수록 앞면이 아래로 가라앉고 지붕이 위에서 보인다.
+  // 원근을 약하게 잡아서 열차는 터널 입구보다 커지지 않는다(화면에 보이는 최대 배율 약 1.37배, 입구 폭 160 > 열차 폭 약 154).
+  // 열차 몸통(편성 전체)이 터널 입구를 모두 빠져나가 화면 아래로 지나갈 때까지 계속 보이며, 그동안 화면에 그려진 열차 이미지에 닿으면 사망.
+  const TRAIN = { z0: 55, F: 92, cars: 14, L: 14 * 19.5, v: 36, tw: 112, th: 144, K: 700 }; // cars: 편성 량 수(량당 약 19.5m, L=길이), v: 속도(m/s), F: 원근 세기(클수록 약함), K: 카메라 높이(클수록 위에서 내려다봄)
+  const TUN = { w: 250, h: 215, mw: 160, ms: 90 }; // 터널: 전체 폭/높이, 입구 폭, 입구 직선부 높이(그 위는 반원)
+  const tunnelDef = { w: TUN.w, draw: (x, v, w) => {
+    const hz = trainHazard, mine = hz.tunnel && Math.abs(hz.tunnel.x - (x + camX)) < .5, on = mine && hz.alarm() && Math.floor(performance.now() / 250) % 2;
+    // 승강장 구역(터널 + 좌우 Z): 타일 벽, 기둥, 표지판, 벤치, 바닥의 선로(원근)
+    const Z = 120, cx = x + w / 2;
+    R('#d6ceb4', x - Z, SUB_C, w + 2 * Z, G - SUB_C);
+    for (let i = x - Z; i < x + w + Z; i += 27) R('rgba(0,0,0,.07)', i, SUB_C, 1, G - SUB_C);
+    R('#2b6f4a', x - Z, G - m(3.8), w + 2 * Z, 6);
+    [x - Z, x + w + Z - 14].forEach(px => { R('#e8e1ce', px, SUB_C, 14, G - SUB_C); R('rgba(0,0,0,.1)', px + 10, SUB_C, 4, G - SUB_C); R('#7a7468', px, G - 20, 14, 20); });
+    R('#4a4a4e', x, G - TUN.h, w, TUN.h); R('#38383c', x - 5, G - TUN.h - 8, w + 10, 8); R('#d8b53c', x - 5, G - TUN.h - 8, w + 10, 3);
+    for (let i = 14; i < w; i += 28) R('rgba(0,0,0,.2)', x + i, G - TUN.h + 6, 2, TUN.h - 6);
+    for (let r = 1; r < 6; r++) R('rgba(0,0,0,.12)', x, G - TUN.h + r * 32, w, 2);
+    const lx = x + (w - TUN.mw) / 2, cy = G - TUN.ms, rr = TUN.mw / 2; // 입구(아치)
+    ctx.fillStyle = '#050507'; ctx.beginPath(); ctx.moveTo(lx, G); ctx.lineTo(lx, cy); ctx.arc(lx + rr, cy, rr, Math.PI, 0); ctx.lineTo(lx + TUN.mw, G); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = '#2e2e32'; ctx.lineWidth = 5; ctx.stroke();
+    text('ТУННЕЛЬ', x + w / 2 - 36, G - TUN.ms - rr - 12, 14, '#d8d8d8');
+    disc(on ? '#ff3030' : '#4a1010', x + 16, G - TUN.h + 16, 6); disc(on ? '#ff3030' : '#4a1010', x + w - 16, G - TUN.h + 16, 6);
+    R('#444', x - 62, SUB_C, 1, G - 175 - SUB_C); R('#1f6f4a', x - 92, G - 175, 64, 24); text('ПУТЬ 1', x - 82, G - 158, 13, '#fff');
+    R('#444', x + w + 62, SUB_C, 1, G - 175 - SUB_C); R('#d8b53c', x + w + 30, G - 175, 64, 24); text('ОСТОРОЖНО', x + w + 34, G - 158, 9, '#222');
+    [x - 100, x + w + 50].forEach(bx => { R('#6b4a30', bx, G - 12, 53, 3); R('#6b4a30', bx, G - 24, 53, 3); R('#3a281d', bx + 3, G - 24, 3, 24); R('#3a281d', bx + 47, G - 24, 3, 24); });
+    // 선로: 바닥(앞쪽으로 이어지는 면)에 원근으로 그림. 터널 입구에서 화면 앞쪽으로 뻗음
+    const hb = y => 70 + (y - G) * .8, rl = y => 40 + (y - G) * .55;
+    poly('#1c1c20', [[cx - hb(G), G], [cx + hb(G), G], [cx + hb(G + 80), G + 80], [cx - hb(G + 80), G + 80]]);
+    [4, 10, 18, 28, 40, 54, 70].forEach(d => R('#3a2f28', cx - hb(G + d) + 3, G + d, 2 * hb(G + d) - 6, 3 + d * .06));
+    [-1, 1].forEach(sd => {
+      ctx.strokeStyle = '#9a9da2'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(cx + sd * rl(G), G); ctx.lineTo(cx + sd * rl(G + 80), G + 80); ctx.stroke();
+      ctx.strokeStyle = '#d8b53c'; ctx.lineWidth = 5; ctx.beginPath(); ctx.moveTo(cx + sd * (hb(G) + 7), G); ctx.lineTo(cx + sd * (hb(G + 80) + 7), G + 80); ctx.stroke();
+      ctx.strokeStyle = 'rgba(200,200,200,.55)'; ctx.lineWidth = 6; ctx.setLineDash([4, 4]); ctx.beginPath(); ctx.moveTo(cx + sd * (hb(G) + 18), G); ctx.lineTo(cx + sd * (hb(G + 80) + 18), G + 80); ctx.stroke(); ctx.setLineDash([]);
+    });
+    if (on) glow(x + w / 2, G - 60, 170, '255,40,40', .3);
+  } };
+  const trainHazard = {
+    cd: 30, tunnel: null, train: null,
+    reset() { this.cd = 30; this.train = null; this.tunnel = null; },
+    alarm() { return !!this.train || this.cd <= 5; },
+    side() { return this.tunnel && this.tunnel.x + this.tunnel.w / 2 < player.wx ? '왼쪽' : '오른쪽'; },
+    warning() {
+      if (this.train) return '열차 통과 중!';
+      return this.cd <= 5 && this.tunnel ? `열차 접근 ${Math.ceil(this.cd)}초! ${this.side()} 터널 앞에서 비키세요` : '';
+    },
+    pick() { // 가장 가까운 터널 선택. 근처에 없으면 시야 밖에 새로 세움(월드에 고정)
+      const st = streams.find(q => q.tunnel); if (!st) return;
+      let best = null, bd = 1100;
+      st.items.forEach(it => { const d = Math.abs(it.x + it.w / 2 - player.wx); if (d < bd) { bd = d; best = it; } });
+      if (!best) {
+        const w = TUN.w, x = Math.random() < .5 ? player.wx + 480 : player.wx - 330 - w; // 장식 제거 여유까지 시야 밖
+        best = { x, w, v: 0, d: st.defs[0] };
+        let i = st.items.findIndex(it => it.x > x); if (i < 0) i = st.items.length; st.items.splice(i, 0, best);
+      }
+      this.tunnel = best;
+    },
+    update(dt) {
+      this.cd -= dt;
+      if (this.cd <= 5 && !this.tunnel && !this.train) this.pick();
+      if (!this.train && this.cd <= 0 && this.tunnel) { this.cd = 30; this.train = { z: TRAIN.z0 }; }
+      const t = this.train; if (!t) return;
+      t.z -= TRAIN.v * dt; // 일정한 속도로 터널에서 나와 카메라 쪽으로 지나감
+      if (t.z + TRAIN.L < this.zCut()) { this.train = null; this.tunnel = null; } // 꼬리까지 화면 아래로 사라지면 끝
+    },
+    sOf(z) { return z > -(TRAIN.F - .1) ? TRAIN.F / (TRAIN.F + z) : 1e3; },
+    sCut() { return (CAM_TOP + H / ZOOM + 4 - G + TRAIN.K) / (TRAIN.K - TRAIN.th); }, // 화면 아래쪽 끝에 닿는 배율
+    zCut() { return TRAIN.F / this.sCut() - TRAIN.F; },
+    cs(z) { return Math.min(this.sCut(), this.sOf(z)); },
+    yAt(s) { return G - TRAIN.K + (TRAIN.K - TRAIN.th) * s; }, // 열차 높이(th)인 점이 배율 s일 때 화면 y (= 지붕선)
+    geom(t) { // 열차 이미지(앞면 + 지붕)의 모양. 그리기와 히트박스가 같은 값을 쓴다
+      const cx = this.tunnel.x + this.tunnel.w / 2, zf = t.z, zt = zf + TRAIN.L, out = { cx };
+      if (zf > 0) { const s = this.sOf(zf), h = TRAIN.th * s; out.front = { s, w: TRAIN.tw * s, h, yb: G, y0: G - h }; return out; } // 아직 터널 안
+      const sf = this.sOf(zf);
+      if (sf < this.sCut()) { const yb = G + TRAIN.K * (sf - 1), h = TRAIN.th * sf; out.front = { s: sf, w: TRAIN.tw * sf, h, yb, y0: yb - h }; }
+      const sN = this.cs(zf), sF = zt >= 0 ? 1 : this.cs(zt); // 지붕: 앞쪽 끝 ~ 꼬리(또는 터널 입구)
+      if (sF < sN - 1e-6) out.roof = { sN, sF, yN: this.yAt(sN), yF: this.yAt(sF), wN: TRAIN.tw * sN, wF: TRAIN.tw * sF };
+      return out;
+    },
+    hits(r) { // 열차가 터널 입구를 지나 나온 뒤, 화면에 그려진 열차 이미지(앞면 사각형 / 지붕 사다리꼴)에 닿으면 사망. r 없으면 플레이어의 피격 박스(숨으면 웅크린 크기)
+      const t = this.train; if (!t || t.z > 0) return false;
+      const g = this.geom(t), p = r || hurt(player);
+      if (g.front) { const f = g.front; if (p.wx < g.cx + f.w / 2 && p.wx + p.w > g.cx - f.w / 2 && p.y < f.yb && p.y + p.h > f.y0) return true; }
+      if (g.roof) {
+        const r = g.roof, top = Math.max(p.y, r.yF), bot = Math.min(p.y + p.h, r.yN);
+        if (top < bot) { const w = TRAIN.tw * (bot - G + TRAIN.K) / (TRAIN.K - TRAIN.th); if (p.wx < g.cx + w / 2 && p.wx + p.w > g.cx - w / 2) return true; }
+      }
+      return false;
+    },
+    drawFront(f, cx) { // 소련/러시아 모스크바 지하철 81-717 "номерной" 형 앞면: 파란 차체, 하늘색 띠, 큰 전면 유리
+      const x0 = cx - f.w / 2, y0 = f.y0, Wt = f.w, Ht = f.h, s = f.s;
+      R('#8b9096', x0, y0, Wt, Ht * .05); R('#2b62a8', x0, y0 + Ht * .05, Wt, Ht * .95);
+      R('#0e1822', x0 + Wt * .08, y0 + Ht * .12, Wt * .84, Ht * .32); R('#2b62a8', x0 + Wt * .49, y0 + Ht * .12, Wt * .02, Ht * .32);
+      R('#a8cfee', x0, y0 + Ht * .5, Wt, Ht * .07); R('#e8e2cf', x0 + Wt * .42, y0 + Ht * .6, Wt * .16, Ht * .06);
+      R('#1d3358', x0, y0 + Ht * .88, Wt, Ht * .12);
+      [.13, .73].forEach(k => R('#fff6d0', x0 + Wt * k, y0 + Ht * .68, Wt * .14, Ht * .07));
+      [.29, .65].forEach(k => R('#d12b2b', x0 + Wt * k, y0 + Ht * .7, Wt * .06, Ht * .05));
+      [.2, .8].forEach(k => glow(x0 + Wt * k, y0 + Ht * .72, 90 * s, '255,240,190', .8));
+    },
+    drawRoof(g, cx, t) { // 위에서 본 지붕: 환기구/설비와 차량 연결부가 카메라 쪽으로 흘러내려온다
+      const r = g.roof;
+      poly('#b4b8be', [[cx - r.wN / 2, r.yN], [cx + r.wN / 2, r.yN], [cx + r.wF / 2, r.yF], [cx - r.wF / 2, r.yF]]);
+      const band = (zN, zF, wf, col) => { // 깊이 zN~zF(m) 구간을 지붕 위에 칠함
+        zN = Math.max(zN, -(TRAIN.F - .1)); zF = Math.min(zF, 0); if (zN >= zF) return;
+        const sN = this.cs(zN), sF = this.cs(zF); if (sF >= sN - 1e-6) return;
+        const yN = this.yAt(sN), yF = this.yAt(sF), wN = TRAIN.tw * sN * wf, wF = TRAIN.tw * sF * wf;
+        poly(col, [[cx - wN / 2, yN], [cx + wN / 2, yN], [cx + wF / 2, yF], [cx - wF / 2, yF]]);
+      };
+      const FEAT = [[2.5, 2, .5, '#8e949b'], [6.5, 3.2, .64, '#7b8189'], [11.5, 2, .5, '#8e949b'], [15, 2.6, .6, '#7b8189']];
+      for (let c = 0; c < TRAIN.cars; c++) {
+        const base = t.z + c * 19.5;
+        FEAT.forEach(f => band(base + f[0], base + f[0] + f[1], f[2], f[3]));
+        if (c < TRAIN.cars - 1) band(base + 18.9, base + 20.1, 1, '#2c2f34'); // 차량 연결부
+      }
+      ctx.strokeStyle = 'rgba(0,0,0,.35)'; ctx.lineWidth = 2; ctx.beginPath();
+      ctx.moveTo(cx - r.wN / 2, r.yN); ctx.lineTo(cx - r.wF / 2, r.yF); ctx.moveTo(cx + r.wN / 2, r.yN); ctx.lineTo(cx + r.wF / 2, r.yF); ctx.stroke();
+    },
+    draw(front) { // front=false: 플레이어 뒤(터널 안, z>0), true: 플레이어 앞(터널 밖으로 나온 뒤, z<=0)
+      const t = this.train; if (!t || (t.z <= 0) !== front) return;
+      const tn = this.tunnel, g = this.geom(t), cx = g.cx - camX;
+      ctx.save();
+      if (t.z > 0) { // 아직 터널 안쪽: 입구 모양으로 잘라서 어둠 속 전조등만 보이게
+        const lx = tn.x - camX + (tn.w - TUN.mw) / 2, cy = G - TUN.ms, rr = TUN.mw / 2;
+        ctx.beginPath(); ctx.moveTo(lx, G); ctx.lineTo(lx, cy); ctx.arc(lx + rr, cy, rr, Math.PI, 0); ctx.lineTo(lx + TUN.mw, G); ctx.closePath(); ctx.clip();
+        ctx.globalAlpha = Math.min(1, .25 + (TRAIN.z0 - t.z) / 40);
+      }
+      if (g.roof) this.drawRoof(g, cx, t);
+      if (g.front) this.drawFront(g.front, cx);
+      ctx.restore();
+    },
+    overlay() { if (this.alarm()) R(`rgba(255,30,30,${.06 + .07 * (1 + Math.sin(performance.now() / 130))})`, 0, 0, W, H); },
+  };
+  const SCENES = [
+    { name: '거리', background: streetBackground, ground: streetGround, streams: [
+      { par: .15, gap: [20, 200], defs: skyDefs },
+      { par: .45, gap: [0, 50], defs: blockDefs, pre: () => R('rgba(190,195,195,.4)', 0, 0, W, G) },
+      { par: 1, gap: [190, 300], defs: [lampDef] },
+      { par: 1, gap: [30, 150], defs: streetFloor, occlude: true, scale: FURN } ] },
+    { name: '카페', background: cafeBackground, ground: cafeGround, streams: [
+      { par: 1, gap: [20, 90], defs: cafeWall },
+      { par: 1, gap: [30, 100], defs: cafeCeil },
+      { par: 1, gap: [14, 100], defs: cafeFloor, occlude: true, scale: FURN } ] },
+    { name: '지하철', hazard: trainHazard, background: subwayBackground, ground: subwayGround, streams: [
+      { par: .3, gap: [0, 60], defs: subTrain },
+      { par: 1, gap: [0, 0], defs: subBay },
+      { par: 1, gap: [150, 420], defs: subHang, avoid: 120 },
+      { par: 1, gap: [20, 130], defs: subFloor, occlude: true, avoid: 120, scale: FURN },
+      { par: 1, gap: [1200, 2400], defs: [tunnelDef], tunnel: true, late: true } ] },
+    { name: '지하 작업실', background: workshopBackground, ground: workshopGround, streams: [
+      { par: 1, gap: [20, 90], defs: wsWall },
+      { par: 1, gap: [30, 130], defs: wsCeil },
+      { par: 1, gap: [14, 100], defs: wsFloor, occlude: true, scale: FURN } ] },
+  ];
+  // 라운드 흐름은 아래 '라운드 흐름' 블록에서 관리 (맵은 투표로 선택)
+  let scene, streams, fade = 0, npcs = []; // npcs: 경기 중 함께 있는 다른 플레이어(봇). (bots = 투표용 봇과 이름 구분)
+  // --- 로비 (맵 후보에는 들어가지 않음) ---
+  function lobbyBackground() {
+    const C = WS_C;
+    R('#2a2b2e', 0, 0, W, C - 22); R('#3a3b3d', 0, C - 22, W, 14); R('#cfd3c8', 0, C - 8, W, 8);
+    R('#9aa092', 0, C, W, G - C);
+    rep(36, 1, 0, x => R('rgba(0,0,0,.05)', x, C, 18, G - C));
+    R('#4a6a58', 0, G - m(1.2), W, m(1.2)); R('#d8d6c4', 0, G - m(1.2), W, 2);
+    R('#e8e6d8', 0, C, W, 4);
+    rep(200, 1, 60, x => { R('#fff6d8', x, C - 4, 36, 4); glow(x + 18, C + 10, 50, '255,246,216', .3); });
+  }
+  function lobbyGround() {
+    R('#7a7468', 0, G, W, GROUND_H); R('#5a564c', 0, G, W, 5);
+    rep(60, 1, 0, x => R('rgba(0,0,0,.15)', x, G + 5, 2, GROUND_H - 5));
+  }
+  const LOBBY = { name: '로비', background: lobbyBackground, ground: lobbyGround, streams: [
+    { par: 1, gap: [40, 140], defs: [wsWall[0], wsWall[1], wsWall[2], wsWall[3], wsWall[4], wsWall[9]] },
+    { par: 1, gap: [40, 160], defs: [subFloor[0], subFloor[1], subFloor[2], subFloor[5], cafeFloor[4], cafeFloor[5]], occlude: true, scale: FURN } ] };
+
+  function enterScene(sc) { // 장면 진입: 소품은 새로 랜덤 배치, 플레이어는 시작 위치로
+    scene = sc;
+    streams = sc.streams.map(c => ({ par: c.par, gap: c.gap, defs: c.defs, pre: c.pre, occlude: c.occlude, tunnel: c.tunnel, late: c.late, avoid: c.avoid, scale: c.scale, items: [], cur: -300, since: c.defs.map(() => 99) }));
+    player.wx = 120; player.vy = 0; player.y = G - player.h; player.onGround = true; camX = 0; fade = 1;
+    player.hiding = false; npcs = sc === LOBBY ? [] : spawnBots(); // 경기 맵에서는 다른 플레이어(봇)가 함께 있음
+    if (sc.hazard) sc.hazard.reset(); // 맵별 위험요소 초기화
+  }
+
+  // =====================================================
+  // 라운드 흐름: 투표 -> 결과 -> 3분 경기 -> 로비 휴식 -> 투표 ...
+  // 다른 플레이어는 봇(BOTS명)이 투표합니다. 시간은 아래 상수에서 조절.
+  // =====================================================
+  const VOTE_T = 15, RESULT_T = 3, MATCH_T = 180, REST_T = 15, BOTS = 5;
+  let phase = 'vote', phaseT = VOTE_T, myVote = -1, votes = [], winner = -1, bots = [], dead = false, msgT = 0, msgText = '', msgCol = '#fff';
+  let scareT = 0; // 점프스케어 남은 시간
+  function kill(why) { dead = true; msgT = 3; msgText = why; msgCol = '#fff'; enterScene(LOBBY); } // 사망: 로비로 복귀, 경기 타이머는 그대로 흐름
+  function revive() {
+    if (!dead) return;
+    dead = false;
+    msgT = 0;
+    msgText = '';
+    if (phase === 'match' && winner >= 0) enterScene(SCENES[winner]);
+  }
+  function skipRound() {
+    if (phase === 'match') phaseT = 0;
+  }
+  function skipWait() {
+    if (phase === 'vote' || phase === 'result' || phase === 'rest') phaseT = 0;
+  }
+  function confirmVote() {
+    if (phase !== 'vote') return;
+    if (myVote < 0) {
+      scareT = 5; // 5초간 점프스케어
+      return;
+    }
+    // 투표수 상관없이 내가 선택한 걸 강제로 채택
+    votes = tally();
+    winner = myVote;
+    phase = 'result';
+    phaseT = RESULT_T;
+    msgT = 0;
+  }
+  function startVote() {
+    phase = 'vote'; phaseT = VOTE_T; myVote = -1; winner = -1; dead = false; enterScene(LOBBY);
+    bots = Array.from({ length: BOTS }, () => ({ at: 2 + Math.random() * (VOTE_T - 5), pick: Math.floor(Math.random() * SCENES.length), done: false }));
+  }
+  function tally() {
+    const v = SCENES.map(() => 0);
+    bots.forEach(b => { if (b.done) v[b.pick]++; });
+    if (myVote >= 0) v[myVote]++;
+    return v;
+  }
+  function updateFlow(dt) {
+    phaseT -= dt;
+    if (phase === 'vote') {
+      const el = VOTE_T - phaseT; bots.forEach(b => { if (!b.done && el >= b.at) b.done = true; });
+      if (phaseT <= 0) {
+        votes = tally(); const mx = Math.max(...votes), c = votes.map((n, i) => i).filter(i => votes[i] === mx);
+        winner = c[Math.floor(Math.random() * c.length)]; phase = 'result'; phaseT = RESULT_T;
+      }
+    } else if (phase === 'result') {
+      if (phaseT <= 0) { phase = 'match'; phaseT = MATCH_T; enterScene(SCENES[winner]); }
+    } else if (phase === 'match') {
+      if (phaseT <= 0) { phase = 'rest'; phaseT = REST_T; if (!dead) enterScene(LOBBY); dead = false; } // 사망했으면 이미 로비에 있음: 경기 시간이 끝난 뒤에만 휴식/투표로
+    } else if (phaseT <= 0) startVote();
+  }
+  function cardRect(i) {
+    const n = SCENES.length, gap = 10, cw = Math.min(150, (W - 40 - (n - 1) * gap) / n), x0 = (W - (n * cw + (n - 1) * gap)) / 2;
+    return { x: x0 + i * (cw + gap), y: 48, w: cw, h: 64 };
+  }
+  function tapVote(p) {
+    for (let i = 0; i < SCENES.length; i++) {
+      const c = cardRect(i);
+      if (p.x >= c.x && p.x <= c.x + c.w && p.y >= c.y && p.y <= c.y + c.h) { myVote = i; return true; }
+    }
+    return false;
+  }
+  function drawHUD() {
+    const sec = Math.max(0, Math.ceil(phaseT)); let title, size = 18, col = '#fff';
+    if (phase === 'vote') title = `맵 투표  ${sec}초`;
+    else if (phase === 'result') title = `선택된 맵: ${SCENES[winner].name}`;
+    else if (phase === 'match') { title = `${dead ? '사망  ' : ''}남은 시간  ${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`; size = 22; if (dead) col = '#b0b4ba'; else if (sec <= 10) col = '#ff6b5e'; }
+    else title = `휴식 시간  ${sec}초`;
+    ctx.textAlign = 'center'; ctx.font = `bold ${size}px sans-serif`;
+    const tw = ctx.measureText(title).width + 28;
+    R('rgba(0,0,0,.45)', W / 2 - tw / 2, 8, tw, size + 14); text(title, W / 2, 8 + size + 2, size, col);
+    if (phase === 'vote' || phase === 'result') {
+      const v = phase === 'vote' ? tally() : votes;
+      SCENES.forEach((sc, i) => {
+        const c = cardRect(i), mine = myVote === i, win = phase === 'result' && winner === i;
+        R(win ? 'rgba(40,110,60,.9)' : 'rgba(20,22,26,.78)', c.x, c.y, c.w, c.h);
+        ctx.strokeStyle = win ? '#7ee08a' : mine ? '#e6c36a' : 'rgba(255,255,255,.25)'; ctx.lineWidth = mine || win ? 3 : 1; ctx.strokeRect(c.x, c.y, c.w, c.h);
+        text(`${i + 1}. ${sc.name}`, c.x + c.w / 2, c.y + 26, 15, '#fff');
+        text(`${v[i]}표`, c.x + c.w / 2, c.y + 50, 14, mine ? '#e6c36a' : '#cfd3d8');
+      });
+      if (phase === 'vote') text('카드를 눌러 투표 (키보드 1~' + SCENES.length + ')', W / 2, 130, 12, 'rgba(255,255,255,.85)');
+    }
+    const warn = scene.hazard && !dead && scene.hazard.warning(), banner = msgT > 0 ? msgText : warn;
+    if (banner) { 
+      ctx.font = 'bold 20px sans-serif'; 
+      const bw = ctx.measureText(banner).width + 36; 
+      R('rgba(120,10,10,.78)', W / 2 - bw / 2, 150, bw, 36); 
+      text(banner, W / 2, 176, 20, msgT > 0 ? msgCol : '#fff'); 
+    }
+    ctx.textAlign = 'left';
+  }
+  function drawScare() {
+    if (scareT <= 0) return;
+    const t = performance.now() / 1000;
+    // 화난 점프스케어: 큰 글씨 + 흔들림 + 빨간색
+    const shakeX = Math.sin(t * 40) * 8;
+    const shakeY = Math.cos(t * 35) * 6;
+    const scale = 1 + Math.sin(t * 12) * 0.04;
+    ctx.save();
+    ctx.translate(W / 2 + shakeX, H / 2 + shakeY);
+    ctx.scale(scale, scale);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = 'bold 48px sans-serif';
+    ctx.fillStyle = '#ff2222';
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 6;
+    ctx.strokeText('맵 먼저 골라라', 0, -10);
+    ctx.fillText('맵 먼저 골라라', 0, -10);
+    ctx.font = 'bold 28px sans-serif';
+    ctx.fillStyle = '#ff6666';
+    ctx.strokeText('!!!', 0, 40);
+    ctx.fillText('!!!', 0, 40);
+    ctx.restore();
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+  }
+  startVote();
+
+  // ---------- 데브툴 ----------
+  const devBtn = document.getElementById('dev-btn');
+  const devPanel = document.getElementById('dev-panel');
+  let devOpen = false;
+  devBtn.addEventListener('click', () => {
+    devOpen = !devOpen;
+    devPanel.style.display = devOpen ? 'block' : 'none';
+  });
+  document.getElementById('btn-revive').addEventListener('click', revive);
+  document.getElementById('btn-skip-round').addEventListener('click', skipRound);
+  document.getElementById('btn-skip-wait').addEventListener('click', skipWait);
+  document.getElementById('btn-confirm-vote').addEventListener('click', confirmVote);
+
+  // =====================================================
+  // 시야 (어몽어스식): 플레이어 눈에서 안 보이는 쪽 가구 끝선 바로 뒤에 짧고 얇은 그림자 선만 그림 (충돌 없음)
+  // 가구를 실제로 그려서 윤곽(불투명 픽셀)을 읽어 가림막(occluder)으로 쓴다.
+  // =====================================================
+  const VIS_R = 460, MP = { pw: 400, ph: 320, pad: 30 };
+  const mcv = document.createElement('canvas'); mcv.width = MP.pw; mcv.height = MP.ph;
+  const mctx = mcv.getContext('2d', { willReadFrequently: true });
+  function measure(it) {
+    if (it.d.noShadow) { it.occ = []; return; } // 문 등: 그림자/가림막 없음
+    const k = it.k || 1, pw = Math.min(MP.pw, Math.ceil(it.w) + 2 * MP.pad);
+    mctx.setTransform(1, 0, 0, 1, 0, 0); mctx.clearRect(0, 0, MP.pw, MP.ph); mctx.setTransform(1, 0, 0, 1, 0, MP.ph - G);
+    if (k !== 1) { mctx.translate(MP.pad, G); mctx.scale(k, k); mctx.translate(-MP.pad, -G); }
+    ctx = mctx;
+    try { it.d.draw(MP.pad, it.v, it.w / k); } catch (e) {} finally { ctx = mainCtx; }
+    const d = mctx.getImageData(0, 0, pw, MP.ph).data, out = []; let open = [];
+    for (let c = 0; c < pw; c++) {
+      const runs = []; let s = -1;
+      for (let y = 0; y <= MP.ph; y++) {
+        const on = y < MP.ph && d[(y * pw + c) * 4 + 3] > 100;
+        if (on && s < 0) s = y; else if (!on && s >= 0) { if (y - s >= 3) runs.push([s, y]); s = -1; }
+      }
+      const next = [];
+      runs.forEach(r => {
+        const o = open.find(q => !q.u && Math.abs(q.y0 - r[0]) <= 2 && Math.abs(q.y1 - r[1]) <= 2);
+        if (o) { o.u = 1; o.x1 = c + 1; next.push(o); } else next.push({ x0: c, x1: c + 1, y0: r[0], y1: r[1], u: 1 });
+      });
+      open.forEach(q => { if (!q.u) out.push(q); });
+      next.forEach(q => { q.u = 0; });
+      open = next;
+    }
+    open.forEach(q => out.push(q));
+    it.occ = out.slice(0, 40).map(r => ({ x0: it.x + r.x0 - MP.pad, x1: it.x + r.x1 - MP.pad, y0: r.y0 - MP.ph + G, y1: r.y1 - MP.ph + G }));
+  }
+  function drawVision() {
+    const ex = player.wx + player.w / 2, ey = player.y + 10, ox = camX, L = 600; // L: 그림자 선의 길이
+    streams.forEach(s => {
+      if (!s.occlude) return;
+      for (const it of s.items) {
+        if (it.x > ex + VIS_R) break;
+        if (it.x + it.w < ex - VIS_R) continue;
+        if (skipItem(s, it)) continue;
+        if (!it.occ) measure(it);
+        if (!it.occ.length) continue;
+        const x0 = Math.min(...it.occ.map(r => r.x0)), x1 = Math.max(...it.occ.map(r => r.x1));
+        const side = x0 > ex + 2 ? 1 : x1 < ex - 2 ? -1 : 0;
+        if (!side) continue; // 플레이어와 겹쳐 있으면 생략
+        const edge = side > 0 ? x1 : x0; // 플레이어 눈에서 보이지 않는 쪽 끝선
+        const g = ctx.createLinearGradient(edge - ox, 0, edge - ox + side * L, 0);
+        const a = Math.min(.9, .35 + .6 * (it.d.depth ?? .5)); // 깊은 가구일수록 진한 그림자
+        g.addColorStop(0, `rgba(0,0,0,${a})`); g.addColorStop(.9, `rgba(0,0,0,${a})`); g.addColorStop(1, 'rgba(0,0,0,0)');
+        ctx.fillStyle = g;
+        it.occ.forEach(r => {
+          if (Math.abs((side > 0 ? r.x1 : r.x0) - edge) > 1) return; // 가장 바깥쪽 조각의 끝선만
+          if (r.y1 - r.y0 < 14) return; // 너무 얇은(낮은) 조각은 그림자 생략
+          const d = Math.abs(edge - ex), sT = (r.y0 - ey) / d, sB = (r.y1 - ey) / d; // 눈에서 본 위/아래 광선
+          ctx.beginPath();
+          ctx.moveTo(edge - ox, r.y0); ctx.lineTo(edge - ox, r.y1);
+          ctx.lineTo(edge - ox + side * L, r.y1 + sB * L); ctx.lineTo(edge - ox + side * L, r.y0 + sT * L);
+          ctx.closePath(); ctx.fill();
+        });
+      }
+    });
+  }
+
+  // =====================================================
+  // 숨기: 가구/장식품 옆에 웅크려 숨는다 (H 키 / 숨기 버튼)
+  // - 다른 사람(봇)의 시점에서 가구 그림자(시선이 가구에 막힌 곳)에 있을 때만 안 보이고,
+  //   시선이 열린 각도에서는 살짝 투명(60%)하게만 보인다.
+  // - 숨으면 몸이 웅크려지고 피격 박스도 그 크기(폭 12, 높이 36)로 줄어서, 가구 옆 밖으로 삐져나오지 않는다.
+  // - 시선 계산은 그림자와 같은 방식: 가구를 실제로 그려 읽은 윤곽(it.occ)을 가림막으로 쓴다.
+  // =====================================================
+  const HIDE = { w: 12, h: 36, reach: 24, vision: 380, minH: 38 }; // minH: 서 있는 플레이어 눈높이(48-10). 이보다 낮은 가구는 못 숨음
+  const BOT_COLS = ['#3f7ed8', '#3fae5a', '#d8b43f', '#a85ad8'];
+  let hideRects = [], nearSpot = null;
+  const hideBtnActive = () => phase === 'match' && scene !== LOBBY && !dead;
+  // 피격 박스: 숨으면 웅크린 몸 크기로 줄어듦
+  const hurt = a => a.hiding ? { wx: a.wx, w: HIDE.w, y: a.y + a.h - HIDE.h, h: HIDE.h } : { wx: a.wx, w: a.w, y: a.y, h: a.h };
+  const eyeOf = a => { const r = hurt(a); return a.hiding ? { x: r.wx + r.w / 2, y: r.y + 6 } : { x: a.wx + a.w / 2, y: a.y + 10 }; };
+  function segHitsRect(x1, y1, x2, y2, r) { // 선분-사각형 교차 (Liang-Barsky)
+    let t0 = 0, t1 = 1; const dx = x2 - x1, dy = y2 - y1;
+    const clip = (pp, q) => { if (pp === 0) return q >= 0; const t = q / pp; if (pp < 0) { if (t > t1) return false; if (t > t0) t0 = t; } else { if (t < t0) return false; if (t < t1) t1 = t; } return true; };
+    return clip(-dx, x1 - r.x0) && clip(dx, r.x1 - x1) && clip(-dy, y1 - r.y0) && clip(dy, r.y1 - y1);
+  }
+  function occluders(ex) { // 눈 주변 가구들의 가림막 사각형
+    const out = [];
+    streams.forEach(q => {
+      if (!q.occlude) return;
+      for (const it of q.items) {
+        if (it.x > ex + VIS_R) break;
+        if (it.x + it.w < ex - VIS_R || skipItem(q, it)) continue;
+        if (!it.occ) measure(it);
+        out.push(...it.occ);
+      }
+    });
+    return out;
+  }
+  function spots(ex) { // 숨을 수 있는 가구 목록: { x0, x1 }
+    const out = [];
+    streams.forEach(q => {
+      if (!q.occlude) return;
+      for (const it of q.items) {
+        if (it.x > ex + VIS_R) break;
+        if (it.x + it.w < ex - VIS_R || !it.d.hide || skipItem(q, it)) continue;
+        if (!it.occ) measure(it);
+        if (!it.occ.length) continue;
+        const x0 = Math.min(...it.occ.map(r => r.x0)), x1 = Math.max(...it.occ.map(r => r.x1)), top = Math.min(...it.occ.map(r => r.y0));
+        if (G - top >= HIDE.minH && x1 - x0 >= 14) out.push({ x0, x1 });
+      }
+    });
+    return out;
+  }
+  function spotFor(a) { // a 바로 옆(reach px 이내)에 있는 숨을 수 있는 가구. side: 1 = 가구가 내 오른쪽, -1 = 왼쪽
+    let best = null, bd = HIDE.reach + 1;
+    spots(a.wx + a.w / 2).forEach(sp => {
+      const dr = Math.abs(a.wx + a.w - sp.x0), dl = Math.abs(a.wx - sp.x1);
+      if (dr < bd) { bd = dr; best = { sp, side: 1 }; }
+      if (dl < bd) { bd = dl; best = { sp, side: -1 }; }
+    });
+    return best;
+  }
+  function startHide(a, f) { a.hiding = true; a.side = f.side; a.face = f.side; a.wx = f.side > 0 ? f.sp.x0 - HIDE.w - 1 : f.sp.x1 + 1; }
+  function stopHide(a) { a.hiding = false; }
+  // 관찰자 obs{x,y}가 숨은 a를 볼 수 있는가: 가구 반대쪽 바깥 가장자리 세 점 중 하나라도 시선이 열려 있으면 보임
+  function seenFrom(obs, a, rects) {
+    const r = hurt(a), x = a.side > 0 ? r.wx : r.wx + r.w;
+    return [r.y + 3, r.y + r.h / 2, r.y + r.h - 3].some(y => !rects.some(q => segHitsRect(obs.x, obs.y, x, y, q)));
+  }
+  function toggleHide() {
+    if (!hideBtnActive()) return;
+    if (player.hiding) { stopHide(player); return; }
+    if (!player.onGround) return;
+    const f = spotFor(player); if (f) startHide(player, f);
+  }
+  function updateHide() {
+    if (!hideBtnActive()) { player.hiding = false; hideRects = []; nearSpot = null; return; }
+    hideRects = occluders(eyeOf(player).x);
+    nearSpot = player.hiding ? null : spotFor(player);
+    player.exposed = player.hiding && npcs.some(b => !b.dead && Math.abs(b.wx - player.wx) < HIDE.vision && seenFrom(eyeOf(b), player, hideRects));
+  }
+  // --- 다른 플레이어(npcs): 돌아다니다가 가끔 가구 옆에 숨고, 열차에 닿으면 사라짐 ---
+  function spawnBots() {
+    return [0, 1, 2].map(i => ({ wx: 350 + i * 330 + Math.random() * 120, y: G - 48, w: 18, h: 48, face: 1, col: BOT_COLS[i], hiding: false, side: 1, dead: false, st: 'wander', t: Math.random() * 2, dir: Math.random() < .5 ? -1 : 1 }));
+  }
+  function updateBots(dt) {
+    npcs.forEach(b => {
+      if (b.dead) return;
+      b.t -= dt;
+      if (b.st === 'wander') {
+        b.wx = Math.max(0, b.wx + b.dir * 55 * dt); b.face = b.dir;
+        if (b.t <= 0) {
+          b.t = 3 + Math.random() * 4; b.dir = Math.random() < .5 ? -1 : 1;
+          if (Math.random() < .4) {
+            const list = spots(b.wx).filter(sp => sp.x0 > 40 && Math.abs(sp.x0 - b.wx) < 420);
+            if (list.length) { const sp = list[Math.floor(Math.random() * list.length)], side = Math.random() < .5 ? 1 : -1; b.goal = { side, x: side > 0 ? sp.x0 - HIDE.w - 1 : sp.x1 + 1 }; b.st = 'goto'; }
+          }
+        }
+      } else if (b.st === 'goto') {
+        const dx = b.goal.x - b.wx, step = 95 * dt; b.face = Math.sign(dx) || 1;
+        if (Math.abs(dx) <= step) { b.wx = b.goal.x; b.hiding = true; b.side = b.goal.side; b.face = b.side; b.st = 'hide'; b.t = 3 + Math.random() * 4; }
+        else b.wx += Math.sign(dx) * step;
+      } else if (b.t <= 0) { b.hiding = false; b.st = 'wander'; b.t = 1 + Math.random() * 2; b.dir = -b.side; }
+      if (scene.hazard && scene.hazard.hits(hurt(b))) b.dead = true; // 열차에 닿으면 탈락
+    });
+  }
+  function drawActor(a, col, alpha) {
+    const r = hurt(a), px = r.wx - camX, k = r.h / 48;
+    ctx.globalAlpha = alpha; R(col, px, r.y, r.w, r.h);
+    const ex = a.face === 1 ? px + r.w - 7 : px + 3;
+    R('#fff', ex, r.y + 8 * k, 4, 4); R('#111', a.face === 1 ? ex + 2 : ex, r.y + 9 * k, 2, 2);
+    ctx.globalAlpha = 1;
+  }
+  function drawBots() { // 숨은 봇은 내 시점에서 그림자에 가려지면 안 보이고, 시선이 열려 있으면 살짝 투명하게 보임
+    const eye = eyeOf(player);
+    npcs.forEach(b => {
+      if (b.dead) return;
+      if (!b.hiding) { drawActor(b, b.col, 1); return; }
+      if (seenFrom(eye, b, hideRects)) drawActor(b, b.col, .6);
+    });
+  }
+
+  // ---------- 플레이어 (180cm = 48px) ----------
+  function drawPlayer() {
+    drawActor(player, '#e8453c', player.hiding ? (player.exposed ? .6 : .35) : 1); // 숨는 중: 보이는 각이면 60%, 완전히 가려지면 내 눈에만 35%
+  }
+
+  // ---------- 입력 ----------
+  const JOY_R = 50;
+  const joy = { active: false, id: null, bx: W - 110, by: H - 100, sx: W - 110, sy: H - 100, dx: 0 };
+  const jbtn = { x: 100, y: H - 90, r: 42, down: false, id: null };
+  const hbtn = { x: 200, y: H - 90, r: 36 }; // 숨기 버튼
+  const keys = {};
+  function jump() { if (player.hiding) { stopHide(player); return; } if (player.onGround) { player.vy = -JUMP_V; player.onGround = false; } }
+  addEventListener('keydown', e => {
+    keys[e.key] = true;
+    if (e.key === 'e' || e.key === 'h') toggleHide();
+    if (phase === 'vote' && /^[1-9]$/.test(e.key) && +e.key <= SCENES.length) myVote = +e.key - 1;
+    if (e.key === ' ' || e.key === 'ArrowUp' || e.key === 'w') { e.preventDefault(); jump(); }
+  });
+  addEventListener('keyup', e => { keys[e.key] = false; });
+  const toLogical = e => { const r = cv.getBoundingClientRect(); return { x: (e.clientX - r.left) * W / r.width, y: (e.clientY - r.top) * H / r.height }; };
+  function moveStick(p) {
+    let vx = p.x - joy.bx, vy = p.y - joy.by; const len = Math.hypot(vx, vy);
+    if (len > JOY_R) { vx = vx / len * JOY_R; vy = vy / len * JOY_R; }
+    joy.sx = joy.bx + vx; joy.sy = joy.by + vy; joy.dx = vx / JOY_R;
+  }
+  function resetStick() { joy.active = false; joy.id = null; joy.dx = 0; joy.bx = W - 110; joy.by = H - 100; joy.sx = joy.bx; joy.sy = joy.by; }
+  cv.addEventListener('pointerdown', e => {
+    e.preventDefault(); const p = toLogical(e);
+    if (phase === 'vote' && tapVote(p)) return;
+    if (hideBtnActive() && Math.hypot(p.x - hbtn.x, p.y - hbtn.y) < hbtn.r + 8) { toggleHide(); return; }
+    if (p.x < W * 0.5) { jbtn.down = true; jbtn.id = e.pointerId; jump(); return; }
+    if (joy.active) return;
+    joy.active = true; joy.id = e.pointerId; joy.bx = p.x; joy.by = p.y; cv.setPointerCapture(e.pointerId); moveStick(p);
+  });
+  cv.addEventListener('pointermove', e => { if (joy.active && e.pointerId === joy.id) moveStick(toLogical(e)); });
+  ['pointerup', 'pointercancel'].forEach(t => cv.addEventListener(t, e => {
+    if (e.pointerId === joy.id) resetStick();
+    if (e.pointerId === jbtn.id) { jbtn.down = false; jbtn.id = null; }
+  }));
+  function drawControls() {
+    ctx.globalAlpha = joy.active ? .55 : .25; disc('#fff', joy.bx, joy.by, JOY_R);
+    ctx.globalAlpha = joy.active ? .9 : .4; disc('#333', joy.sx, joy.sy, 22);
+    ctx.globalAlpha = jbtn.down ? .6 : .3; disc('#fff', jbtn.x, jbtn.y, jbtn.r);
+    ctx.globalAlpha = .75; ctx.textAlign = 'center'; text('점프', jbtn.x, jbtn.y + 6, 16, '#222'); ctx.textAlign = 'left';
+    if (hideBtnActive()) { // 숨기 버튼: 숨을 수 있는 가구 옆이면 진하게
+      ctx.globalAlpha = player.hiding ? .65 : nearSpot ? .55 : .2; disc(player.hiding ? '#9ec8e6' : '#fff', hbtn.x, hbtn.y, hbtn.r);
+      ctx.globalAlpha = .85; ctx.textAlign = 'center'; text(player.hiding ? '해제' : '숨기', hbtn.x, hbtn.y + 5, 14, '#222'); ctx.textAlign = 'left';
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- 루프 ----------
+  let last = performance.now();
+  function loop(t) {
+    const dt = Math.min((t - last) / 1000, 0.05); last = t;
+    updateFlow(dt); fade = Math.max(0, fade - dt * 2.5); msgT = Math.max(0, msgT - dt);
+    scareT = Math.max(0, scareT - dt);
+    let d = Math.abs(joy.dx) > 0.15 ? joy.dx : 0;
+    if (keys['ArrowRight'] || keys['d']) d = 1;
+    if (keys['ArrowLeft'] || keys['a']) d = -1;
+    if (player.hiding) { if (Math.abs(d) > .6) stopHide(player); else d = 0; } // 숨는 중에는 제자리 (세게 밀면 해제)
+    if (d !== 0) player.face = d > 0 ? 1 : -1;
+    player.wx = Math.max(0, player.wx + d * SPEED * dt);
+    camX = Math.max(0, player.wx - CAM_LEAD);
+    if (phase === 'match' && !dead && scene.hazard) { scene.hazard.update(dt); if (scene.hazard.hits()) kill('열차에 치였습니다'); }
+    if (phase === 'match') updateBots(dt);
+    updateHide();
+
+    player.vy += GRAVITY * dt; player.y += player.vy * dt;
+    const floor = GROUND_Y - player.h;
+    if (player.y >= floor) { player.y = floor; player.vy = 0; player.onGround = true; }
+
+    ctx.save(); ctx.scale(ZOOM, ZOOM); ctx.translate(0, -CAM_TOP);
+    scene.background(); streams.forEach(q => { if (!q.late) drawStream(q); }); scene.ground();
+    streams.forEach(q => { if (q.late) drawStream(q); }); // late: 바닥 위에 그려야 하는 것(선로 등)
+    drawBots();
+    drawVision();
+    if (scene.hazard) scene.hazard.draw(false);
+    drawPlayer();
+    if (scene.hazard) scene.hazard.draw(true);
+    ctx.restore();
+    if (fade > 0) R(`rgba(0,0,0,${fade})`, 0, 0, W, H);
+    if (scene.hazard && !dead) scene.hazard.overlay();
+    drawControls(); drawHUD();
+    drawScare();
+    ctx.font = '14px sans-serif'; ctx.fillStyle = 'rgba(255,255,255,.85)';
+    ctx.fillText('Москва, 1998 - ' + scene.name, 14, 24);
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
